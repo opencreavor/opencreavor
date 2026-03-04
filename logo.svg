@@ -1,0 +1,45 @@
+<svg
+  viewBox="0 0 100 100"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <defs>
+    <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3b82f6" />
+      <stop offset="100%" stop-color="#06b6d4" />
+    </linearGradient>
+  </defs>
+
+  <!-- 外框 -->
+  <path
+    d="M50 8 L86 29 L86 71 L50 92 L14 71 L14 29 Z"
+    stroke="url(#logoGradient)"
+    stroke-width="12"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    fill="none"
+  />
+
+  <!-- 连接线 -->
+  <path
+    d="M50 20 L50 36"
+    stroke="url(#logoGradient)"
+    stroke-width="10"
+    stroke-linecap="round"
+  />
+  <path
+    d="M26 62 L40 54"
+    stroke="url(#logoGradient)"
+    stroke-width="10"
+    stroke-linecap="round"
+  />
+  <path
+    d="M74 62 L60 54"
+    stroke="url(#logoGradient)"
+    stroke-width="10"
+    stroke-linecap="round"
+  />
+
+  <!-- 核心 -->
+  <circle cx="50" cy="50" r="14" fill="#3b82f6" />
+</svg>
+
