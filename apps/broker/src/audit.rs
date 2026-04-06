@@ -1,6 +1,11 @@
 use crate::{proxy::TerminalReason, storage::AuditStorage};
 use anyhow::Context;
+use axum::http::HeaderMap;
 use rusqlite::params;
+use serde_json::Value;
+use std::path::Path;
+
+const SESSION_HEADER: &str = "x-creavor-session-id";
 
 impl AuditStorage {
     pub fn insert_event(
@@ -59,7 +64,11 @@ impl AuditStorage {
                  completed_at = CURRENT_TIMESTAMP
              WHERE request_id = ?1
                AND completed_at IS NULL",
-            params![request_id, terminal_reason.as_str(), response_status.map(i64::from)],
+            params![
+                request_id,
+                terminal_reason.as_str(),
+                response_status.map(i64::from)
+            ],
         )?;
 
         if changed == 0 {
@@ -112,9 +121,112 @@ impl AuditStorage {
     }
 }
 
+pub fn event_type_from_payload(payload: &Value) -> &str {
+    payload
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("local.event")
+}
+
+pub fn correlation_id_for_event(headers: &HeaderMap, payload: &Value) -> String {
+    if let Some(session_id) = headers
+        .get(SESSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    {
+        return session_id.to_string();
+    }
+
+    let runtime = payload
+        .get("runtime")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    let bucket = payload
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(timestamp_bucket)
+        .unwrap_or("unknown-time".to_string());
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .and_then(cwd_suffix);
+
+    match cwd {
+        Some(cwd) => format!("{runtime}:{bucket}:{cwd}"),
+        None => format!("{runtime}:{bucket}"),
+    }
+}
+
+pub fn sanitize_local_event_payload(payload: Value, correlation_id: String) -> Value {
+    let mut sanitized = redact_sensitive_fields(payload);
+    match &mut sanitized {
+        Value::Object(object) => {
+            object.insert("correlation_id".to_string(), Value::String(correlation_id));
+        }
+        other => {
+            *other = serde_json::json!({
+                "correlation_id": correlation_id,
+                "value": other.clone(),
+            });
+        }
+    }
+    sanitized
+}
+
+fn redact_sensitive_fields(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(redact_sensitive_fields).collect())
+        }
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    if is_sensitive_key(&key) {
+                        return None;
+                    }
+
+                    Some((key, redact_sensitive_fields(value)))
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("event_auth_token")
+}
+
+fn timestamp_bucket(timestamp: &str) -> Option<String> {
+    let prefix = timestamp.get(0..16)?;
+    let bytes = prefix.as_bytes();
+    let valid_layout = bytes.len() == 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':';
+    if !valid_layout {
+        return None;
+    }
+
+    Some(format!("{prefix}:00Z"))
+}
+
+fn cwd_suffix(cwd: &str) -> Option<String> {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
 
     fn started_storage() -> AuditStorage {
         AuditStorage::open_in_memory().unwrap()
@@ -170,7 +282,12 @@ mod tests {
             )
             .unwrap();
         storage
-            .finalize_request("req-1", TerminalReason::Ok, Some(200), Some("{\"id\":\"resp-1\"}"))
+            .finalize_request(
+                "req-1",
+                TerminalReason::Ok,
+                Some(200),
+                Some("{\"id\":\"resp-1\"}"),
+            )
             .unwrap();
 
         let request = storage
@@ -265,10 +382,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(
-            persisted,
-            (Some("client_cancelled".to_string()), None, 1)
-        );
+        assert_eq!(persisted, (Some("client_cancelled".to_string()), None, 1));
 
         let response_payload_count: i64 = storage
             .connection()
@@ -344,7 +458,12 @@ mod tests {
             )
             .unwrap();
         storage
-            .finalize_request("req-4", TerminalReason::Ok, Some(200), Some("{\"id\":\"first\"}"))
+            .finalize_request(
+                "req-4",
+                TerminalReason::Ok,
+                Some(200),
+                Some("{\"id\":\"first\"}"),
+            )
             .unwrap();
 
         let second = storage.finalize_request(
@@ -362,7 +481,12 @@ mod tests {
                  FROM requests
                  WHERE request_id = ?1",
                 ["req-4"],
-                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(request, (Some("ok".to_string()), Some(200)));
@@ -376,5 +500,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(response_body, "{\"id\":\"first\"}");
+    }
+
+    #[test]
+    fn correlation_id_prefers_creavor_session_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(SESSION_HEADER, HeaderValue::from_static("session-123"));
+
+        let correlation_id = correlation_id_for_event(
+            &headers,
+            &serde_json::json!({
+                "runtime": "codex",
+                "timestamp": "2026-04-07T12:34:56Z",
+                "cwd": "/tmp/demo",
+            }),
+        );
+
+        assert_eq!(correlation_id, "session-123");
+    }
+
+    #[test]
+    fn correlation_id_falls_back_to_runtime_bucket_and_cwd() {
+        let correlation_id = correlation_id_for_event(
+            &HeaderMap::new(),
+            &serde_json::json!({
+                "runtime": "codex",
+                "timestamp": "2026-04-07T12:34:56.789Z",
+                "cwd": "/Users/norman/project",
+            }),
+        );
+
+        assert_eq!(correlation_id, "codex:2026-04-07T12:34:00Z:project");
+    }
+
+    #[test]
+    fn sanitize_local_event_payload_adds_correlation_and_drops_sensitive_keys() {
+        let payload = sanitize_local_event_payload(
+            serde_json::json!({
+                "type": "editor.event",
+                "authorization": "Bearer secret",
+                "nested": {
+                    "event_auth_token": "secret"
+                }
+            }),
+            "session-123".to_string(),
+        );
+
+        assert_eq!(payload["correlation_id"], serde_json::json!("session-123"));
+        assert!(payload.get("authorization").is_none());
+        assert!(payload["nested"].get("event_auth_token").is_none());
     }
 }

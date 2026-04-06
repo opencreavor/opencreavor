@@ -1,5 +1,6 @@
 pub mod audit;
 pub mod config;
+pub mod events;
 pub mod interceptor;
 pub mod proxy;
 pub mod router;
