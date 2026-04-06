@@ -12,8 +12,12 @@ pub fn strip_session_header(headers: &mut HeaderMap) {
 }
 
 pub fn anthropic_block_response(message: &str) -> Response {
+    anthropic_block_response_with_status(StatusCode::BAD_REQUEST, message)
+}
+
+pub fn anthropic_block_response_with_status(status: StatusCode, message: &str) -> Response {
     (
-        StatusCode::BAD_REQUEST,
+        status,
         [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
         Body::from(
             json!({
@@ -30,8 +34,12 @@ pub fn anthropic_block_response(message: &str) -> Response {
 }
 
 pub fn openai_block_response(message: &str) -> Response {
+    openai_block_response_with_status(StatusCode::BAD_REQUEST, message)
+}
+
+pub fn openai_block_response_with_status(status: StatusCode, message: &str) -> Response {
     (
-        StatusCode::BAD_REQUEST,
+        status,
         [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
         Body::from(
             json!({
@@ -84,6 +92,28 @@ mod tests {
         let response = openai_block_response("blocked");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            body_as_json(response).await,
+            json!({
+                "error": {
+                    "message": "blocked",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": null,
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_block_response_with_status_overrides_status_code() {
+        let response = openai_block_response_with_status(StatusCode::FORBIDDEN, "blocked");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),
             "application/json"
