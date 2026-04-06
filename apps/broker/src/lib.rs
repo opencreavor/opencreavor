@@ -1,3 +1,3 @@
-pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }

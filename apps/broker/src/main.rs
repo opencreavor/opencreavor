@@ -1,4 +1,4 @@
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
     creavor_broker::run().await
 }
