@@ -47,9 +47,9 @@ impl Default for BrokerConfig {
         Self {
             block_status_code: 400,
             block_error_style: "auto".to_string(),
-            stream_passthrough: false,
-            upstream_timeout: Duration::from_secs(30),
-            idle_stream_timeout: Duration::from_secs(30),
+            stream_passthrough: true,
+            upstream_timeout: Duration::from_secs(300),
+            idle_stream_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -167,9 +167,9 @@ mod tests {
 
         assert_eq!(config.broker.block_status_code, 400);
         assert_eq!(config.broker.block_error_style, "auto");
-        assert!(!config.broker.stream_passthrough);
-        assert_eq!(config.broker.upstream_timeout, Duration::from_secs(30));
-        assert_eq!(config.broker.idle_stream_timeout, Duration::from_secs(30));
+        assert!(config.broker.stream_passthrough);
+        assert_eq!(config.broker.upstream_timeout, Duration::from_secs(300));
+        assert_eq!(config.broker.idle_stream_timeout, Duration::from_secs(120));
         assert_eq!(config.audit.event_auth_token, None);
         assert!(!config.rules.llm.analyzer.enabled);
     }
