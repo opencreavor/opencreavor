@@ -170,7 +170,14 @@ mod tests {
         );
         assert_eq!(
             column_names(&storage, "violations"),
-            vec!["id", "request_id", "rule_name", "action", "detail", "created_at"]
+            vec![
+                "id",
+                "request_id",
+                "rule_name",
+                "action",
+                "detail",
+                "created_at"
+            ]
         );
     }
 
@@ -216,15 +223,21 @@ mod tests {
         let counts = (
             storage
                 .connection()
-                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM events", [], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .unwrap(),
             storage
                 .connection()
-                .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM requests", [], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .unwrap(),
             storage
                 .connection()
-                .query_row("SELECT COUNT(*) FROM violations", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM violations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .unwrap(),
         );
         assert_eq!(counts, (1, 1, 1));

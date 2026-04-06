@@ -140,11 +140,7 @@ mod tests {
     fn no_false_positive_baseline_returns_none() {
         let rules = RuleSet::builtin();
 
-        assert!(scan_request(
-            "The quick brown fox jumps over the lazy dog.",
-            &rules
-        )
-        .is_none());
+        assert!(scan_request("The quick brown fox jumps over the lazy dog.", &rules).is_none());
     }
 
     #[test]

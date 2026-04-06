@@ -222,12 +222,11 @@ where
 
     match time::timeout(timeouts.upstream, upstream).await {
         Ok(Ok(upstream)) => {
-            let mut response =
-                Response::new(Body::from_stream(ProxyBodyStream::new(
-                    upstream.body,
-                    timeouts.idle,
-                    CompletionSignal::new(tx),
-                )));
+            let mut response = Response::new(Body::from_stream(ProxyBodyStream::new(
+                upstream.body,
+                timeouts.idle,
+                CompletionSignal::new(tx),
+            )));
             *response.status_mut() = upstream.status;
             *response.headers_mut() = sanitize_forwarded_headers(upstream.headers);
 
@@ -435,12 +434,7 @@ mod tests {
         assert!(matches!(second_frame.as_mut().now_or_never(), None));
 
         time::advance(Duration::from_secs(10)).await;
-        let second = second_frame
-            .await
-            .unwrap()
-            .unwrap()
-            .into_data()
-            .unwrap();
+        let second = second_frame.await.unwrap().unwrap().into_data().unwrap();
         assert_eq!(second, Bytes::from_static(b"data: second\n\n"));
     }
 
@@ -554,10 +548,7 @@ mod tests {
                 Ok(UpstreamResponse::new(
                     StatusCode::OK,
                     HeaderMap::new(),
-                    MockChunkStream::new([
-                        ChunkStep::Ready(b"chunk"),
-                        ChunkStep::PendingForever,
-                    ]),
+                    MockChunkStream::new([ChunkStep::Ready(b"chunk"), ChunkStep::PendingForever]),
                 ))
             },
             ProxyTimeouts::new(Duration::from_secs(5), Duration::from_secs(3)),
