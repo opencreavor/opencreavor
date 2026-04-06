@@ -1,9 +1,30 @@
 use crate::{
     config::Config,
     events::{post_events, EventsState},
+    interceptor::{
+        anthropic_block_response_with_status, openai_block_response_with_status,
+        strip_session_header,
+    },
+    proxy::{forward_upstream, BoxError, ProxyTimeouts, UpstreamResponse},
+    rule_engine::{scan_request, RuleSet},
     storage::AuditStorage,
 };
-use axum::{routing::post, Router};
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    http::{HeaderMap, HeaderName, Response, StatusCode, Uri},
+    routing::post,
+    Router,
+};
+use futures_util::TryStreamExt;
+use http_body_util::BodyExt;
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+};
+
+const CONTENT_LENGTH: HeaderName = HeaderName::from_static("content-length");
+const HOST: HeaderName = HeaderName::from_static("host");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -27,6 +48,155 @@ pub fn app(config: Config, storage: AuditStorage) -> Router {
     Router::new()
         .route("/api/v1/events", post(post_events))
         .with_state(EventsState::new(config.audit.event_auth_token, storage))
+}
+
+#[derive(Clone)]
+struct ProxyState {
+    config: Config,
+    rules: RuleSet,
+    upstream_base_url: String,
+    client: Client<HttpConnector, Body>,
+}
+
+pub fn proxy_app(config: Config, upstream_base_url: String) -> Router {
+    let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
+
+    Router::new()
+        .route("/v1/openai", post(proxy_request))
+        .route("/v1/openai/{*path}", post(proxy_request))
+        .route("/v1/anthropic", post(proxy_request))
+        .route("/v1/anthropic/{*path}", post(proxy_request))
+        .with_state(ProxyState {
+            config,
+            rules: RuleSet::builtin(),
+            upstream_base_url,
+            client,
+        })
+}
+
+async fn proxy_request(State(state): State<ProxyState>, request: Request) -> Response<Body> {
+    let provider = match provider_for_path(request.uri().path()) {
+        Some(provider) => provider,
+        None => return terminal_response(StatusCode::NOT_FOUND),
+    };
+
+    let method = request.method().clone();
+    let upstream_uri = upstream_uri(&state.upstream_base_url, provider, request.uri());
+    let mut headers = request.headers().clone();
+    strip_session_header(&mut headers);
+    headers.remove(HOST);
+    headers.remove(CONTENT_LENGTH);
+
+    let request_body = request.into_body().collect().await.unwrap().to_bytes();
+    let request_body_text = String::from_utf8(request_body.to_vec()).unwrap();
+
+    if let Some(rule_match) = scan_request(&request_body_text, &state.rules) {
+        let message = format!(
+            "Blocked by Creavor broker: {} ({})",
+            rule_match.rule_name, rule_match.matched_content_sanitized
+        );
+        return block_response(provider, &state.config, &message);
+    }
+
+    let upstream_request = upstream_request(method, upstream_uri, headers, request_body_text.clone());
+    if state.config.broker.stream_passthrough {
+        let forwarded = forward_upstream(
+            upstream_response(state.client.clone(), upstream_request),
+            ProxyTimeouts::new(
+                state.config.broker.upstream_timeout,
+                state.config.broker.idle_stream_timeout,
+            ),
+        )
+        .await;
+        return forwarded.response;
+    }
+
+    match state.client.request(upstream_request).await {
+        Ok(upstream_response) => buffered_response(upstream_response).await,
+        Err(_) => terminal_response(StatusCode::BAD_GATEWAY),
+    }
+}
+
+fn block_response(provider: Provider, config: &Config, message: &str) -> Response<Body> {
+    let status =
+        StatusCode::from_u16(config.broker.block_status_code).unwrap_or(StatusCode::BAD_REQUEST);
+    match provider {
+        Provider::Anthropic => anthropic_block_response_with_status(status, message),
+        Provider::OpenAI => openai_block_response_with_status(status, message),
+    }
+}
+
+fn upstream_uri(base_url: &str, provider: Provider, uri: &Uri) -> String {
+    let prefix = match provider {
+        Provider::Anthropic => "/v1/anthropic",
+        Provider::OpenAI => "/v1/openai",
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path());
+    let suffix = path_and_query.strip_prefix(prefix).unwrap_or(path_and_query);
+    let suffix = if suffix.is_empty() { "/" } else { suffix };
+
+    format!("{}{}", base_url.trim_end_matches('/'), suffix)
+}
+
+fn upstream_request(method: axum::http::Method, uri: String, headers: HeaderMap, body: String) -> Request {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::from(body))
+        .expect("proxy upstream request should be valid");
+    *request.headers_mut() = headers;
+    request
+}
+
+async fn upstream_response(
+    client: Client<HttpConnector, Body>,
+    request: Request,
+) -> Result<UpstreamResponse, BoxError> {
+    let upstream_response = client.request(request).await.map_err(box_error)?;
+    let status = upstream_response.status();
+    let headers = upstream_response.headers().clone();
+    let body = upstream_response
+        .into_body()
+        .into_data_stream()
+        .map_err(box_error);
+
+    Ok(UpstreamResponse::new(status, headers, body))
+}
+
+async fn buffered_response(
+    upstream_response: hyper::Response<hyper::body::Incoming>,
+) -> Response<Body> {
+    let status = upstream_response.status();
+    let headers = upstream_response.headers().clone();
+    let bytes = upstream_response
+        .into_body()
+        .collect()
+        .await
+        .map(|body| body.to_bytes())
+        .unwrap_or_default();
+
+    Response::builder()
+        .status(status)
+        .body(Body::from(bytes))
+        .map(|mut response| {
+            *response.headers_mut() = headers;
+            response
+        })
+        .expect("buffered upstream response should be valid")
+}
+
+fn terminal_response(status: StatusCode) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .body(Body::empty())
+        .expect("synthetic terminal response should be valid")
+}
+
+fn box_error(error: impl Into<BoxError>) -> BoxError {
+    error.into()
 }
 
 #[cfg(test)]
@@ -149,6 +319,16 @@ mod tests {
     #[test]
     fn ignores_unknown_paths() {
         assert_eq!(provider_for_path("/v1/other/messages"), None);
+    }
+
+    #[test]
+    fn proxy_upstream_uri_strips_provider_prefix() {
+        let uri = Uri::from_static("/v1/openai/responses?stream=true");
+
+        assert_eq!(
+            upstream_uri("http://127.0.0.1:8080/", Provider::OpenAI, &uri),
+            "http://127.0.0.1:8080/responses?stream=true"
+        );
     }
 
     #[tokio::test]

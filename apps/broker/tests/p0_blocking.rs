@@ -1,17 +1,5 @@
-use axum::{
-    body::Body,
-    extract::{Request, State},
-    http::{Response, StatusCode},
-    routing::post,
-    Router,
-};
-use creavor_broker::{
-    config::Config,
-    interceptor::{openai_block_response_with_status, strip_session_header},
-    router::{provider_for_path, Provider},
-    rule_engine::{scan_request, RuleSet},
-};
-use futures_util::TryStreamExt;
+use axum::{body::Body, http::StatusCode, routing::post, Router};
+use creavor_broker::{config::Config, router};
 use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -26,90 +14,6 @@ use std::{
     },
 };
 use tokio::{net::TcpListener, task::JoinHandle};
-
-#[derive(Clone)]
-struct ProxyState {
-    config: Config,
-    rules: RuleSet,
-    upstream_base_url: String,
-    client: Client<HttpConnector, Body>,
-}
-
-async fn proxy_openai(
-    State(state): State<ProxyState>,
-    request: Request,
-) -> Response<Body> {
-    let provider = provider_for_path(request.uri().path()).expect("known provider path");
-    let method = request.method().clone();
-    let mut headers = request.headers().clone();
-    let request_body = request.into_body().collect().await.unwrap().to_bytes();
-    let request_body_text = String::from_utf8(request_body.to_vec()).unwrap();
-
-    if let Some(rule_match) = scan_request(&request_body_text, &state.rules) {
-        let message = format!(
-            "Blocked by Creavor broker: {} ({})",
-            rule_match.rule_name, rule_match.matched_content_sanitized
-        );
-        return match provider {
-            Provider::OpenAI => {
-                openai_block_response_with_status(
-                    StatusCode::from_u16(state.config.broker.block_status_code).unwrap(),
-                    &message,
-                )
-            }
-            Provider::Anthropic => unreachable!("test only wires OpenAI path"),
-        };
-    }
-
-    strip_session_header(&mut headers);
-    let mut upstream_request = axum::http::Request::builder()
-        .method(method)
-        .uri(format!("{}/responses", state.upstream_base_url));
-    if let Some(content_type) = headers.get("content-type") {
-        upstream_request = upstream_request.header("content-type", content_type);
-    }
-
-    let upstream_response = state
-        .client
-        .request(
-            upstream_request
-                .body(Body::from(request_body_text))
-                .expect("valid upstream request"),
-        )
-        .await
-        .expect("upstream request should succeed");
-
-    let status = upstream_response.status();
-    let headers = upstream_response.headers().clone();
-    let body = Body::from_stream(
-        upstream_response
-            .into_body()
-            .into_data_stream()
-            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) }),
-    );
-
-    Response::builder()
-        .status(status)
-        .body(body)
-        .map(|mut response| {
-            *response.headers_mut() = headers;
-            response
-        })
-        .unwrap()
-}
-
-fn proxy_app(config: Config, upstream_base_url: String) -> Router {
-    let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
-
-    Router::new()
-        .route("/v1/openai/responses", post(proxy_openai))
-        .with_state(ProxyState {
-            config,
-            rules: RuleSet::builtin(),
-            upstream_base_url,
-            client,
-        })
-}
 
 fn upstream_app(call_count: Arc<AtomicUsize>) -> Router {
     Router::new().route(
@@ -154,14 +58,15 @@ async fn send_json_request(base_url: &str, path: &str, body: Value) -> hyper::Re
 }
 
 #[tokio::test]
-async fn blocked_secret_request_returns_provider_block_and_skips_upstream() {
+async fn p0_blocked_secret_request_returns_provider_block_and_skips_upstream() {
     let upstream_call_count = Arc::new(AtomicUsize::new(0));
     let (upstream_base_url, upstream_server) =
         spawn_http_app(upstream_app(upstream_call_count.clone())).await;
 
     let mut config = Config::default();
     config.broker.block_status_code = 451;
-    let (broker_base_url, broker_server) = spawn_http_app(proxy_app(config, upstream_base_url)).await;
+    let (broker_base_url, broker_server) =
+        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
 
     let response = send_json_request(
         &broker_base_url,

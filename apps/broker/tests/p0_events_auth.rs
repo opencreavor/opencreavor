@@ -81,7 +81,7 @@ fn persisted_events(path: &PathBuf) -> Vec<(String, Option<String>, String)> {
 }
 
 #[tokio::test]
-async fn event_ingestion_requires_valid_bearer_token_before_persisting() {
+async fn p0_event_ingestion_requires_valid_bearer_token_before_persisting() {
     let path = unique_temp_path("acceptance");
     let storage = AuditStorage::open(&path).unwrap();
     let mut config = Config::default();
