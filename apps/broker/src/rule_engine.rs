@@ -98,7 +98,7 @@ fn load_rule_file(yaml: &str) -> anyhow::Result<Vec<CompiledRule>> {
 fn sanitize_matched_content(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
     if chars.len() <= 6 {
-        return value.to_owned();
+        return "***".to_string();
     }
 
     let prefix_len = 3;
@@ -145,6 +145,25 @@ mod tests {
             &rules
         )
         .is_none());
+    }
+
+    #[test]
+    fn short_match_redaction_returns_fully_masked_value() {
+        assert_eq!(sanitize_matched_content("ab"), "***");
+    }
+
+    #[test]
+    fn parenthesized_phone_number_detection_regression() {
+        let rules = RuleSet::builtin();
+
+        let body = "call me at (555) 123-4567";
+        let result = scan_request(body, &rules).unwrap();
+
+        assert_eq!(result.rule_id, "phone-number-001");
+        assert_eq!(result.rule_name, "Phone Number");
+        assert_eq!(result.severity, "medium");
+        assert!(result.matched_content_sanitized.contains("***"));
+        assert_ne!(result.matched_content_sanitized, "(555) 123-4567");
     }
 
     #[test]
