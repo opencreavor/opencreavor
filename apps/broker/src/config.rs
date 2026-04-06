@@ -54,10 +54,26 @@ impl Default for BrokerConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AuditConfig {
+    #[serde(serialize_with = "redact_event_auth_token")]
     pub event_auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for AuditConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("AuditConfig");
+        match self.event_auth_token {
+            Some(_) => {
+                debug.field("event_auth_token", &Some("<redacted>"));
+            }
+            None => {
+                debug.field("event_auth_token", &Option::<&str>::None);
+            }
+        }
+        debug.finish()
+    }
 }
 
 impl Default for AuditConfig {
@@ -108,7 +124,7 @@ impl Default for RulesLlmAnalyzerConfig {
     }
 }
 
-pub fn resolve_env_ref(value: &str) -> anyhow::Result<String> {
+fn resolve_env_ref(value: &str) -> anyhow::Result<String> {
     if let Some(name) = value.strip_prefix("env:") {
         if name.is_empty() {
             anyhow::bail!("invalid env reference: missing variable name");
@@ -119,6 +135,16 @@ pub fn resolve_env_ref(value: &str) -> anyhow::Result<String> {
     }
 
     Ok(value.to_owned())
+}
+
+fn redact_event_auth_token<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match value {
+        Some(_) => serializer.serialize_some("<redacted>"),
+        None => serializer.serialize_none(),
+    }
 }
 
 mod duration_secs {
@@ -175,6 +201,36 @@ mod tests {
     }
 
     #[test]
+    fn config_debug_redacts_event_auth_token() {
+        let config = Config {
+            audit: AuditConfig {
+                event_auth_token: Some("super-secret".to_string()),
+            },
+            ..Config::default()
+        };
+
+        let debug = format!("{:?}", config);
+
+        assert!(!debug.contains("super-secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn config_serialize_redacts_event_auth_token() {
+        let config = Config {
+            audit: AuditConfig {
+                event_auth_token: Some("super-secret".to_string()),
+            },
+            ..Config::default()
+        };
+
+        let serialized = serde_json::to_string(&config).unwrap();
+
+        assert!(!serialized.contains("super-secret"));
+        assert!(serialized.contains("<redacted>"));
+    }
+
+    #[test]
     fn resolve_env_ref_reads_environment_variable() {
         let _guard = poison_resilient_lock();
         env::set_var("CREAVOR_BROKER_TEST_TOKEN", "secret-token");
@@ -212,6 +268,86 @@ event_auth_token = "env:CREAVOR_BROKER_AUDIT_TOKEN"
             Some("resolved-from-env")
         );
         env::remove_var("CREAVOR_BROKER_AUDIT_TOKEN");
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn config_load_inherits_defaults_for_partial_toml() {
+        let mut path: PathBuf = env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("creavor-broker-config-partial-{unique}.toml"));
+        fs::write(&path, "[broker]\nblock_status_code = 403\n").unwrap();
+
+        let config = Config::load(&path).unwrap();
+
+        assert_eq!(config.broker.block_status_code, 403);
+        assert_eq!(config.broker.block_error_style, "auto");
+        assert!(config.broker.stream_passthrough);
+        assert_eq!(config.broker.upstream_timeout, Duration::from_secs(300));
+        assert_eq!(config.broker.idle_stream_timeout, Duration::from_secs(120));
+        assert_eq!(config.audit.event_auth_token, None);
+        assert!(!config.rules.llm.analyzer.enabled);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn config_load_rejects_unknown_fields() {
+        let mut path: PathBuf = env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("creavor-broker-config-unknown-{unique}.toml"));
+        fs::write(&path, "[broker]\nunknown_field = true\n").unwrap();
+
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("unknown_field"));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn config_load_rejects_malformed_env_ref() {
+        let mut path: PathBuf = env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("creavor-broker-config-bad-env-{unique}.toml"));
+        fs::write(&path, "[audit]\nevent_auth_token = \"env:\"\n").unwrap();
+
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("missing variable name"));
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn config_load_rejects_missing_env_ref() {
+        let _guard = poison_resilient_lock();
+        let mut path: PathBuf = env::temp_dir();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("creavor-broker-config-missing-env-{unique}.toml"));
+        fs::write(
+            &path,
+            "[audit]\nevent_auth_token = \"env:CREAVOR_BROKER_MISSING_TOKEN\"\n",
+        )
+        .unwrap();
+
+        let err = Config::load(&path).unwrap_err().to_string();
+
+        assert!(err.contains("missing environment variable"));
+        assert!(err.contains("CREAVOR_BROKER_MISSING_TOKEN"));
+
         fs::remove_file(&path).unwrap();
     }
 }
