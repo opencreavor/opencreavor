@@ -33,6 +33,8 @@ impl Config {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BrokerConfig {
+    pub port: u16,
+    pub log_level: String,
     pub block_status_code: u16,
     pub block_error_style: String,
     pub stream_passthrough: bool,
@@ -45,6 +47,8 @@ pub struct BrokerConfig {
 impl Default for BrokerConfig {
     fn default() -> Self {
         Self {
+            port: 8765,
+            log_level: "info".to_string(),
             block_status_code: 400,
             block_error_style: "auto".to_string(),
             stream_passthrough: true,
@@ -191,6 +195,8 @@ mod tests {
     fn config_defaults_match_p0_spec() {
         let config = Config::default();
 
+        assert_eq!(config.broker.port, 8765);
+        assert_eq!(config.broker.log_level, "info");
         assert_eq!(config.broker.block_status_code, 400);
         assert_eq!(config.broker.block_error_style, "auto");
         assert!(config.broker.stream_passthrough);
