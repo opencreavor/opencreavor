@@ -9,13 +9,13 @@ impl AuditStorage {
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(Self { connection })
+        Self::from_connection(connection)
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(Self { connection })
+        Self::from_connection(connection)
     }
 
     pub fn initialize(&self) -> anyhow::Result<()> {
@@ -70,6 +70,12 @@ impl AuditStorage {
         Ok(())
     }
 
+    fn from_connection(connection: Connection) -> anyhow::Result<Self> {
+        let storage = Self { connection };
+        storage.initialize()?;
+        Ok(storage)
+    }
+
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
     }
@@ -78,6 +84,20 @@ impl AuditStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::TerminalReason;
+    use std::{
+        env, fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("creavor-broker-{name}-{nanos}.sqlite"))
+    }
 
     fn table_names(storage: &AuditStorage) -> Vec<String> {
         let mut statement = storage
@@ -111,8 +131,6 @@ mod tests {
     #[test]
     fn initializes_expected_audit_tables() {
         let storage = AuditStorage::open_in_memory().unwrap();
-
-        storage.initialize().unwrap();
 
         assert_eq!(
             table_names(&storage),
@@ -164,5 +182,70 @@ mod tests {
         storage.initialize().unwrap();
 
         assert_eq!(table_names(&storage).len(), 5);
+    }
+
+    #[test]
+    fn open_in_memory_allows_immediate_audit_writes() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+
+        storage
+            .insert_event("broker.started", None, Some("{\"ready\":true}"))
+            .unwrap();
+        storage
+            .insert_request_start(
+                "req-open-memory",
+                "openai",
+                "POST",
+                "/v1/openai/responses",
+                None,
+                "{\"input\":\"hello\"}",
+            )
+            .unwrap();
+        storage
+            .insert_violation("req-open-memory", "secrets", "block", "matched")
+            .unwrap();
+        storage
+            .finalize_request(
+                "req-open-memory",
+                TerminalReason::Ok,
+                Some(200),
+                Some("{\"id\":\"resp-open-memory\"}"),
+            )
+            .unwrap();
+
+        let counts = (
+            storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM events", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            storage
+                .connection()
+                .query_row("SELECT COUNT(*) FROM violations", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+        );
+        assert_eq!(counts, (1, 1, 1));
+    }
+
+    #[test]
+    fn open_file_allows_immediate_audit_writes() {
+        let path = unique_temp_path("storage-open");
+
+        let storage = AuditStorage::open(&path).unwrap();
+        storage
+            .insert_event("broker.started", None, Some("{\"ready\":true}"))
+            .unwrap();
+
+        let event_count: i64 = storage
+            .connection()
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        drop(storage);
+        let _ = fs::remove_file(path);
     }
 }

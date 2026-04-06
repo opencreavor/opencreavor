@@ -57,12 +57,27 @@ impl AuditStorage {
              SET terminal_reason = ?2,
                  response_status = ?3,
                  completed_at = CURRENT_TIMESTAMP
-             WHERE request_id = ?1",
+             WHERE request_id = ?1
+               AND completed_at IS NULL",
             params![request_id, terminal_reason.as_str(), response_status.map(i64::from)],
         )?;
 
         if changed == 0 {
-            anyhow::bail!("cannot finalize missing request: {request_id}");
+            let request_state = transaction.query_row(
+                "SELECT completed_at IS NOT NULL
+                 FROM requests
+                 WHERE request_id = ?1",
+                [request_id],
+                |row| row.get::<_, i64>(0),
+            );
+            match request_state {
+                Ok(1) => anyhow::bail!("request already finalized: {request_id}"),
+                Ok(_) => anyhow::bail!("cannot finalize missing request: {request_id}"),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    anyhow::bail!("cannot finalize missing request: {request_id}")
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         if let Some(body) = response_body {
@@ -102,9 +117,7 @@ mod tests {
     use super::*;
 
     fn started_storage() -> AuditStorage {
-        let storage = AuditStorage::open_in_memory().unwrap();
-        storage.initialize().unwrap();
-        storage
+        AuditStorage::open_in_memory().unwrap()
     }
 
     #[test]
@@ -314,5 +327,54 @@ mod tests {
                 "api key matched".to_string(),
             )
         );
+    }
+
+    #[test]
+    fn finalize_request_fails_on_second_terminal_write_and_preserves_first_result() {
+        let storage = started_storage();
+
+        storage
+            .insert_request_start(
+                "req-4",
+                "openai",
+                "POST",
+                "/v1/openai/responses",
+                None,
+                "{\"input\":\"first\"}",
+            )
+            .unwrap();
+        storage
+            .finalize_request("req-4", TerminalReason::Ok, Some(200), Some("{\"id\":\"first\"}"))
+            .unwrap();
+
+        let second = storage.finalize_request(
+            "req-4",
+            TerminalReason::ClientCancelled,
+            Some(499),
+            Some("{\"id\":\"second\"}"),
+        );
+        assert!(second.is_err());
+
+        let request = storage
+            .connection()
+            .query_row(
+                "SELECT terminal_reason, response_status
+                 FROM requests
+                 WHERE request_id = ?1",
+                ["req-4"],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(request, (Some("ok".to_string()), Some(200)));
+
+        let response_body: String = storage
+            .connection()
+            .query_row(
+                "SELECT body FROM response_payloads WHERE request_id = ?1",
+                ["req-4"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(response_body, "{\"id\":\"first\"}");
     }
 }
