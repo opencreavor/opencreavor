@@ -94,6 +94,12 @@ mod tests {
         config
     }
 
+    fn blank_token_config() -> Config {
+        let mut config = Config::default();
+        config.audit.event_auth_token = Some("   ".to_string());
+        config
+    }
+
     fn unique_temp_path(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -173,6 +179,25 @@ mod tests {
         let response = send_events_request(
             &base_url,
             Some("wrong-secret"),
+            Some("session-123"),
+            json!({"type":"editor.event","timestamp":"2026-04-07T00:00:00Z"}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn events_blank_configured_token_still_rejects_bearer_request() {
+        let path = unique_temp_path("blank-token");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(blank_token_config(), storage).await;
+
+        let response = send_events_request(
+            &base_url,
+            Some(""),
             Some("session-123"),
             json!({"type":"editor.event","timestamp":"2026-04-07T00:00:00Z"}),
         )
@@ -304,6 +329,36 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn events_rate_limit_isolated_between_distinct_correlation_keys() {
+        let path = unique_temp_path("rate-limit-isolated");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_config(), storage).await;
+
+        for _ in 0..32 {
+            let response = send_events_request(
+                &base_url,
+                Some("local-events-secret"),
+                Some("burst-session-a"),
+                json!({"type":"editor.event","timestamp":"2026-04-07T00:00:00Z"}),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+        }
+
+        let response = send_events_request(
+            &base_url,
+            Some("local-events-secret"),
+            Some("burst-session-b"),
+            json!({"type":"editor.event","timestamp":"2026-04-07T00:00:00Z"}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
         server.abort();
         let _ = fs::remove_file(path);
     }

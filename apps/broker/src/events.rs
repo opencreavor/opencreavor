@@ -9,7 +9,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -27,7 +27,7 @@ pub struct EventsState {
 impl EventsState {
     pub fn new(expected_token: Option<String>, storage: AuditStorage) -> Self {
         Self {
-            expected_token,
+            expected_token: normalize_expected_token(expected_token),
             storage: Arc::new(Mutex::new(storage)),
             rate_limiter: Arc::new(Mutex::new(LocalRateLimiter::new(
                 RATE_LIMIT_WINDOW,
@@ -56,8 +56,8 @@ impl EventsState {
         token == expected_token
     }
 
-    fn allow_event(&self) -> bool {
-        self.rate_limiter.lock().unwrap().allow(Instant::now())
+    fn allow_event(&self, key: &str) -> bool {
+        self.rate_limiter.lock().unwrap().allow(key, Instant::now())
     }
 
     fn persist_event(&self, payload: &Value, correlation_id: &str) -> anyhow::Result<()> {
@@ -84,15 +84,15 @@ pub async fn post_events(
             .into_response();
     }
 
-    if !state.allow_event() {
+    let correlation_id = correlation_id_for_event(&headers, &payload);
+
+    if !state.allow_event(&correlation_id) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({ "error": "rate_limited" })),
         )
             .into_response();
     }
-
-    let correlation_id = correlation_id_for_event(&headers, &payload);
     let sanitized_payload = sanitize_local_event_payload(payload, correlation_id.clone());
 
     match state.persist_event(&sanitized_payload, &correlation_id) {
@@ -108,10 +108,21 @@ pub async fn post_events(
     }
 }
 
+fn normalize_expected_token(expected_token: Option<String>) -> Option<String> {
+    expected_token.and_then(|token| {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 struct LocalRateLimiter {
     window: Duration,
     limit: usize,
-    recent_events: VecDeque<Instant>,
+    recent_events: HashMap<String, VecDeque<Instant>>,
 }
 
 impl LocalRateLimiter {
@@ -119,23 +130,28 @@ impl LocalRateLimiter {
         Self {
             window,
             limit,
-            recent_events: VecDeque::with_capacity(limit),
+            recent_events: HashMap::new(),
         }
     }
 
-    fn allow(&mut self, now: Instant) -> bool {
-        while let Some(oldest) = self.recent_events.front().copied() {
+    fn allow(&mut self, key: &str, now: Instant) -> bool {
+        let events = self
+            .recent_events
+            .entry(key.to_string())
+            .or_insert_with(|| VecDeque::with_capacity(self.limit));
+
+        while let Some(oldest) = events.front().copied() {
             if now.duration_since(oldest) < self.window {
                 break;
             }
-            self.recent_events.pop_front();
+            events.pop_front();
         }
 
-        if self.recent_events.len() >= self.limit {
+        if events.len() >= self.limit {
             return false;
         }
 
-        self.recent_events.push_back(now);
+        events.push_back(now);
         true
     }
 }
@@ -149,9 +165,9 @@ mod tests {
         let mut limiter = LocalRateLimiter::new(Duration::from_secs(1), 2);
         let now = Instant::now();
 
-        assert!(limiter.allow(now));
-        assert!(limiter.allow(now));
-        assert!(!limiter.allow(now));
+        assert!(limiter.allow("session-a", now));
+        assert!(limiter.allow("session-a", now));
+        assert!(!limiter.allow("session-a", now));
     }
 
     #[test]
@@ -159,8 +175,28 @@ mod tests {
         let mut limiter = LocalRateLimiter::new(Duration::from_secs(1), 1);
         let now = Instant::now();
 
-        assert!(limiter.allow(now));
-        assert!(!limiter.allow(now));
-        assert!(limiter.allow(now + Duration::from_secs(1)));
+        assert!(limiter.allow("session-a", now));
+        assert!(!limiter.allow("session-a", now));
+        assert!(limiter.allow("session-a", now + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn local_rate_limiter_is_scoped_per_key() {
+        let mut limiter = LocalRateLimiter::new(Duration::from_secs(1), 1);
+        let now = Instant::now();
+
+        assert!(limiter.allow("session-a", now));
+        assert!(!limiter.allow("session-a", now));
+        assert!(limiter.allow("session-b", now));
+    }
+
+    #[test]
+    fn normalize_expected_token_rejects_blank_values() {
+        assert_eq!(normalize_expected_token(Some(String::new())), None);
+        assert_eq!(normalize_expected_token(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_expected_token(Some(" secret ".to_string())),
+            Some("secret".to_string())
+        );
     }
 }

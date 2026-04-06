@@ -4,6 +4,7 @@ use axum::http::HeaderMap;
 use rusqlite::params;
 use serde_json::Value;
 use std::path::Path;
+use time::{format_description::well_known::Rfc3339, macros::format_description, OffsetDateTime};
 
 const SESSION_HEADER: &str = "x-creavor-session-id";
 
@@ -197,22 +198,32 @@ fn redact_sensitive_fields(value: Value) -> Value {
 }
 
 fn is_sensitive_key(key: &str) -> bool {
-    key.eq_ignore_ascii_case("authorization") || key.eq_ignore_ascii_case("event_auth_token")
+    key.eq_ignore_ascii_case("authorization")
+        || key.eq_ignore_ascii_case("event_auth_token")
+        || key.eq_ignore_ascii_case("proxy-authorization")
+        || key.eq_ignore_ascii_case("cookie")
+        || key.eq_ignore_ascii_case("set-cookie")
+        || key.eq_ignore_ascii_case("x-api-key")
 }
 
 fn timestamp_bucket(timestamp: &str) -> Option<String> {
-    let prefix = timestamp.get(0..16)?;
-    let bytes = prefix.as_bytes();
-    let valid_layout = bytes.len() == 16
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes[10] == b'T'
-        && bytes[13] == b':';
-    if !valid_layout {
-        return None;
-    }
+    let timestamp = OffsetDateTime::parse(timestamp, &Rfc3339).ok()?;
+    let utc_timestamp = timestamp.to_offset(time::UtcOffset::UTC);
+    let minute_bucket = utc_timestamp
+        .replace_second(0)
+        .ok()?
+        .replace_millisecond(0)
+        .ok()?
+        .replace_microsecond(0)
+        .ok()?
+        .replace_nanosecond(0)
+        .ok()?;
 
-    Some(format!("{prefix}:00Z"))
+    minute_bucket
+        .format(&format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:00Z"
+        ))
+        .ok()
 }
 
 fn cwd_suffix(cwd: &str) -> Option<String> {
@@ -534,13 +545,45 @@ mod tests {
     }
 
     #[test]
+    fn correlation_id_uses_utc_bucket_for_offset_timestamp() {
+        let correlation_id = correlation_id_for_event(
+            &HeaderMap::new(),
+            &serde_json::json!({
+                "runtime": "codex",
+                "timestamp": "2026-04-07T20:34:56+08:00",
+                "cwd": "/Users/norman/project",
+            }),
+        );
+
+        assert_eq!(correlation_id, "codex:2026-04-07T12:34:00Z:project");
+    }
+
+    #[test]
+    fn correlation_id_keeps_unknown_time_fallback_for_malformed_timestamp() {
+        let correlation_id = correlation_id_for_event(
+            &HeaderMap::new(),
+            &serde_json::json!({
+                "runtime": "codex",
+                "timestamp": "definitely-not-rfc3339",
+                "cwd": "/Users/norman/project",
+            }),
+        );
+
+        assert_eq!(correlation_id, "codex:unknown-time:project");
+    }
+
+    #[test]
     fn sanitize_local_event_payload_adds_correlation_and_drops_sensitive_keys() {
         let payload = sanitize_local_event_payload(
             serde_json::json!({
                 "type": "editor.event",
                 "authorization": "Bearer secret",
                 "nested": {
-                    "event_auth_token": "secret"
+                    "event_auth_token": "secret",
+                    "proxy-authorization": "Basic abc",
+                    "cookie": "session=value",
+                    "set-cookie": "session=value",
+                    "x-api-key": "secret-key"
                 }
             }),
             "session-123".to_string(),
@@ -549,5 +592,9 @@ mod tests {
         assert_eq!(payload["correlation_id"], serde_json::json!("session-123"));
         assert!(payload.get("authorization").is_none());
         assert!(payload["nested"].get("event_auth_token").is_none());
+        assert!(payload["nested"].get("proxy-authorization").is_none());
+        assert!(payload["nested"].get("cookie").is_none());
+        assert!(payload["nested"].get("set-cookie").is_none());
+        assert!(payload["nested"].get("x-api-key").is_none());
     }
 }
