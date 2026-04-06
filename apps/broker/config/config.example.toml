@@ -1,0 +1,19 @@
+[broker]
+port = 8765
+log_level = "info"
+block_status_code = 400
+block_error_style = "auto"
+stream_passthrough = true
+# seconds
+upstream_timeout = 300
+idle_stream_timeout = 120
+
+[audit]
+# Set as env ref in production
+# export CREAVOR_BROKER_EVENT_TOKEN="$(openssl rand -hex 32)"
+event_auth_token = "env:CREAVOR_BROKER_EVENT_TOKEN"
+
+[rules]
+[rules.llm]
+[rules.llm.analyzer]
+enabled = false

@@ -80,3 +80,41 @@ At the same time, everything is pluggable:
 - Deployment targets  
 
 It is **ready to run**, and built to **evolve with your organization**.
+
+---
+
+## Creavor Broker (P0)
+
+`creavor-broker` is a local interception proxy for AI coding runtimes.
+
+### Quick Start
+
+1. Create an event auth token:
+
+```bash
+export CREAVOR_BROKER_EVENT_TOKEN="$(openssl rand -hex 32)"
+```
+
+2. Start broker with example config:
+
+```bash
+cargo run -p creavor-broker -- --config apps/broker/config/config.example.toml
+```
+
+3. Point runtime API base URL to broker:
+
+- Claude Code: `http://127.0.0.1:8765/v1/anthropic`
+- OpenCode/OpenClaw: `http://127.0.0.1:8765/v1/openai`
+
+### Key Runtime Controls
+
+- `block_status_code` defaults to `400`
+- `block_error_style` defaults to `auto`
+- `stream_passthrough` defaults to `true`
+- `upstream_timeout` and `idle_stream_timeout` control streaming behavior
+
+### Runtime Setup Docs
+
+- `runtimes/claude-code/README.md`
+- `runtimes/opencode/README.md`
+- `runtimes/openclaw/README.md`
