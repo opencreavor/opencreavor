@@ -1,6 +1,6 @@
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, Response, StatusCode},
+    http::{HeaderMap, HeaderName, Response, StatusCode},
 };
 use futures_core::Stream;
 use std::{
@@ -16,6 +16,16 @@ use tokio::time::{self, Instant, Sleep};
 
 pub type BoxError = Box<dyn Error + Send + Sync>;
 pub type UpstreamBody = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send + 'static>>;
+
+const CONTENT_LENGTH: HeaderName = HeaderName::from_static("content-length");
+const CONNECTION: HeaderName = HeaderName::from_static("connection");
+const KEEP_ALIVE: HeaderName = HeaderName::from_static("keep-alive");
+const PROXY_AUTHENTICATE: HeaderName = HeaderName::from_static("proxy-authenticate");
+const PROXY_AUTHORIZATION: HeaderName = HeaderName::from_static("proxy-authorization");
+const TE: HeaderName = HeaderName::from_static("te");
+const TRAILER: HeaderName = HeaderName::from_static("trailer");
+const TRANSFER_ENCODING: HeaderName = HeaderName::from_static("transfer-encoding");
+const UPGRADE: HeaderName = HeaderName::from_static("upgrade");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalReason {
@@ -219,7 +229,7 @@ where
                     CompletionSignal::new(tx),
                 )));
             *response.status_mut() = upstream.status;
-            *response.headers_mut() = upstream.headers;
+            *response.headers_mut() = sanitize_forwarded_headers(upstream.headers);
 
             ForwardedResponse {
                 response,
@@ -250,6 +260,19 @@ fn terminal_response(status: StatusCode) -> Response<Body> {
         .status(status)
         .body(Body::empty())
         .expect("synthetic terminal response should be valid")
+}
+
+fn sanitize_forwarded_headers(mut headers: HeaderMap) -> HeaderMap {
+    headers.remove(CONTENT_LENGTH);
+    headers.remove(CONNECTION);
+    headers.remove(KEEP_ALIVE);
+    headers.remove(PROXY_AUTHENTICATE);
+    headers.remove(PROXY_AUTHORIZATION);
+    headers.remove(TE);
+    headers.remove(TRAILER);
+    headers.remove(TRANSFER_ENCODING);
+    headers.remove(UPGRADE);
+    headers
 }
 
 #[cfg(test)]
@@ -357,6 +380,22 @@ mod tests {
         headers
     }
 
+    fn upstream_headers_with_hop_by_hop_values() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "text/event-stream".parse().unwrap());
+        headers.insert("x-upstream-header", "kept".parse().unwrap());
+        headers.insert("content-length", "123".parse().unwrap());
+        headers.insert("connection", "keep-alive".parse().unwrap());
+        headers.insert("keep-alive", "timeout=5".parse().unwrap());
+        headers.insert("proxy-authenticate", "Basic realm=test".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic dGVzdA==".parse().unwrap());
+        headers.insert("te", "trailers".parse().unwrap());
+        headers.insert("trailer", "expires".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        headers.insert("upgrade", "h2c".parse().unwrap());
+        headers
+    }
+
     #[tokio::test(start_paused = true)]
     async fn sse_chunks_are_forwarded_without_waiting_for_full_body() {
         let forwarded = forward_upstream(
@@ -403,6 +442,34 @@ mod tests {
             .into_data()
             .unwrap();
         assert_eq!(second, Bytes::from_static(b"data: second\n\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_response_strips_content_length_and_hop_by_hop_headers() {
+        let forwarded = forward_upstream(
+            async {
+                Ok(UpstreamResponse::new(
+                    StatusCode::OK,
+                    upstream_headers_with_hop_by_hop_values(),
+                    MockChunkStream::new([ChunkStep::Ready(b"chunk"), ChunkStep::End]),
+                ))
+            },
+            ProxyTimeouts::new(Duration::from_secs(5), Duration::from_secs(5)),
+        )
+        .await;
+
+        let headers = forwarded.response.headers();
+        assert_eq!(headers.get("content-type").unwrap(), "text/event-stream");
+        assert_eq!(headers.get("x-upstream-header").unwrap(), "kept");
+        assert!(headers.get("content-length").is_none());
+        assert!(headers.get("connection").is_none());
+        assert!(headers.get("keep-alive").is_none());
+        assert!(headers.get("proxy-authenticate").is_none());
+        assert!(headers.get("proxy-authorization").is_none());
+        assert!(headers.get("te").is_none());
+        assert!(headers.get("trailer").is_none());
+        assert!(headers.get("transfer-encoding").is_none());
+        assert!(headers.get("upgrade").is_none());
     }
 
     #[tokio::test(start_paused = true)]
