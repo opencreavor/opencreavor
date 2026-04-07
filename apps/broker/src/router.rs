@@ -594,4 +594,56 @@ mod tests {
         server.abort();
         let _ = fs::remove_file(path);
     }
+
+    // ── Health endpoint tests ──────────────────────────────────────────
+
+    async fn send_health_request(base_url: &str, path: &str) -> hyper::Response<hyper::body::Incoming> {
+        let client: Client<HttpConnector, Body> =
+            Client::builder(TokioExecutor::new()).build_http();
+        client
+            .request(
+                axum::http::Request::builder()
+                    .uri(format!("{base_url}{path}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_root_returns_ok() {
+        let path = unique_temp_path("health-root");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_config(), storage).await;
+
+        let response = send_health_request(&base_url, "/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "creavor-broker");
+
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn health_explicit_path_returns_ok() {
+        let path = unique_temp_path("health-path");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_config(), storage).await;
+
+        let response = send_health_request(&base_url, "/health").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["service"], "creavor-broker");
+
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
 }
