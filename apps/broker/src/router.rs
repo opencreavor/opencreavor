@@ -13,13 +13,14 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{HeaderMap, HeaderName, Response, StatusCode, Uri},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
+use hyper_tls::HttpsConnector;
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
+    client::legacy::Client,
     rt::TokioExecutor,
 };
 
@@ -46,8 +47,18 @@ pub fn provider_for_path(path: &str) -> Option<Provider> {
 
 pub fn app(config: Config, storage: AuditStorage) -> Router {
     Router::new()
+        .route("/", get(health))
+        .route("/health", get(health))
         .route("/api/v1/events", post(post_events))
         .with_state(EventsState::new(config.audit.event_auth_token, storage))
+}
+
+async fn health() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"status":"ok","service":"creavor-broker"}"#))
+        .expect("health response should be valid")
 }
 
 #[derive(Clone)]
@@ -55,11 +66,14 @@ struct ProxyState {
     config: Config,
     rules: RuleSet,
     upstream_base_url: String,
-    client: Client<HttpConnector, Body>,
+    client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
 }
 
 pub fn proxy_app(config: Config, upstream_base_url: String) -> Router {
-    let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
+    let client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body> =
+        Client::builder(TokioExecutor::new()).build(
+            HttpsConnector::new()
+        );
 
     Router::new()
         .route("/v1/openai", post(proxy_request))
@@ -81,7 +95,17 @@ async fn proxy_request(State(state): State<ProxyState>, request: Request) -> Res
     };
 
     let method = request.method().clone();
+    let request_path = request.uri().path().to_owned();
     let upstream_uri = upstream_uri(&state.upstream_base_url, provider, request.uri());
+
+    tracing::info!(
+        method = %method,
+        path = %request_path,
+        upstream = %upstream_uri,
+        provider = ?provider,
+        "proxy request received"
+    );
+
     let mut headers = request.headers().clone();
     strip_session_header(&mut headers);
     headers.remove(HOST);
@@ -91,6 +115,11 @@ async fn proxy_request(State(state): State<ProxyState>, request: Request) -> Res
     let request_body_text = String::from_utf8(request_body.to_vec()).unwrap();
 
     if let Some(rule_match) = scan_request(&request_body_text, &state.rules) {
+        tracing::warn!(
+            rule = %rule_match.rule_name,
+            path = %request_path,
+            "request blocked by rule engine"
+        );
         let message = format!(
             "Blocked by Creavor broker: {} ({})",
             rule_match.rule_name, rule_match.matched_content_sanitized
@@ -98,7 +127,7 @@ async fn proxy_request(State(state): State<ProxyState>, request: Request) -> Res
         return block_response(provider, &state.config, &message);
     }
 
-    let upstream_request = upstream_request(method, upstream_uri, headers, request_body_text.clone());
+    let upstream_request = upstream_request(method.clone(), upstream_uri.clone(), headers, request_body_text.clone());
     if state.config.broker.stream_passthrough {
         let forwarded = forward_upstream(
             upstream_response(state.client.clone(), upstream_request),
@@ -108,12 +137,35 @@ async fn proxy_request(State(state): State<ProxyState>, request: Request) -> Res
             ),
         )
         .await;
+        tracing::info!(
+            method = %method,
+            path = %request_path,
+            status = %forwarded.response.status(),
+            "proxy request completed (streaming)"
+        );
         return forwarded.response;
     }
 
     match state.client.request(upstream_request).await {
-        Ok(upstream_response) => buffered_response(upstream_response).await,
-        Err(_) => terminal_response(StatusCode::BAD_GATEWAY),
+        Ok(upstream_response) => {
+            tracing::info!(
+                method = %method,
+                path = %request_path,
+                status = %upstream_response.status(),
+                "proxy request completed (buffered)"
+            );
+            buffered_response(upstream_response).await
+        }
+        Err(e) => {
+            tracing::error!(
+                method = %method,
+                path = %request_path,
+                upstream = %upstream_uri,
+                error = %e,
+                "upstream request failed"
+            );
+            terminal_response(StatusCode::BAD_GATEWAY)
+        }
     }
 }
 
@@ -152,7 +204,7 @@ fn upstream_request(method: axum::http::Method, uri: String, headers: HeaderMap,
 }
 
 async fn upstream_response(
-    client: Client<HttpConnector, Body>,
+    client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
     request: Request,
 ) -> Result<UpstreamResponse, BoxError> {
     let upstream_response = client.request(request).await.map_err(box_error)?;

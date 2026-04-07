@@ -235,7 +235,8 @@ where
                 completion,
             }
         }
-        Ok(Err(_err)) => {
+        Ok(Err(err)) => {
+            tracing::error!(error = %err, "upstream connection failed");
             let mut signal = CompletionSignal::new(tx);
             signal.finish(TerminalReason::NetworkError);
             ForwardedResponse {

@@ -14,10 +14,23 @@ pub async fn run() -> anyhow::Result<()> {
         None => config::Config::default(),
     };
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.broker.log_level)),
+        )
+        .init();
+
     let db_path = std::env::var("CREAVOR_BROKER_DB_PATH")
         .unwrap_or_else(|_| "/tmp/creavor-broker.sqlite".to_string());
     let upstream_base_url = std::env::var("CREAVOR_UPSTREAM_BASE_URL")
         .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+
+    tracing::info!(
+        port = config.broker.port,
+        upstream = %upstream_base_url,
+        "starting creavor-broker"
+    );
 
     let storage = storage::AuditStorage::open(db_path)?;
     let events_app = router::app(config.clone(), storage);
@@ -26,7 +39,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], config.broker.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("creavor-broker listening on http://{addr}");
+    tracing::info!("creavor-broker listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }
