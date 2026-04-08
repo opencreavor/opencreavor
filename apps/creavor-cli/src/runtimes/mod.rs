@@ -9,10 +9,7 @@ pub fn run(runtime: RuntimeType) -> anyhow::Result<()> {
         RuntimeType::Claude => claude::run(),
         RuntimeType::OpenCode => opencode::run(),
         RuntimeType::OpenClaw => openclaw::run(),
-        RuntimeType::Codex | RuntimeType::Cline | RuntimeType::Gemini => {
-            // TODO: implement these runtime launchers
-            anyhow::bail!("runtime '{}' is not yet implemented", runtime.name())
-        }
+        other => anyhow::bail!("runtime '{}' is not yet implemented", other.name()),
     }
 }
 
@@ -21,9 +18,6 @@ pub fn config(runtime: RuntimeType) -> anyhow::Result<()> {
         RuntimeType::Claude => claude::config(),
         RuntimeType::OpenCode => opencode::config(),
         RuntimeType::OpenClaw => openclaw::config(),
-        RuntimeType::Codex | RuntimeType::Cline | RuntimeType::Gemini => {
-            // TODO: implement these runtime configs
-            anyhow::bail!("config for '{}' is not yet implemented", runtime.name())
-        }
+        other => anyhow::bail!("runtime '{}' config is not yet implemented", other.name()),
     }
 }
