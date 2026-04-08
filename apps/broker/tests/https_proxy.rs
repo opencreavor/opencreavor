@@ -251,3 +251,216 @@ async fn https_connector_streaming_passthrough_forwards_chunks() {
     broker_server.abort();
     upstream_server.abort();
 }
+
+#[tokio::test]
+async fn https_connector_get_request_405() {
+    let config = Config::default();
+    let (broker_base_url, broker_server) =
+        spawn_http_app(router::proxy_app(config, "http://127.0.0.1:8080".to_string())).await;
+
+    let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
+    let response = client
+        .request(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(format!("{broker_base_url}/v1/anthropic/messages"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    broker_server.abort();
+}
+
+
+#[tokio::test]
+async fn https_connector_large_request_body_handling() {
+    let upstream = Router::new().route(
+        "/messages",
+        post(|req: axum::extract::Request| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let size = body.len();
+            let first_chars = String::from_utf8(body.to_vec());
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                Body::from(
+                    json!({
+                        "status": "ok",
+                        "received_size": size,
+                        "first_chars": if first_chars.is_ok() { first_chars.unwrap() } else { "error".to_string() }
+                    })
+                    .to_string(),
+                ),
+            )
+        }),
+    );
+    let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
+
+    let config = Config::default();
+    let (broker_base_url, broker_server) =
+        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+
+    // Create a large request body
+    let large_content = "x".repeat(10000);
+    let large_json = json!({
+        "model": "claude-3-opus",
+        "max_tokens": 100,
+        "messages": [
+            {
+                "role": "user",
+                "content": "This is a test message with some longer content to test larger request bodies. "
+            },
+            {
+                "role": "assistant",
+                "content": large_content
+            }
+        ]
+    });
+
+    let response = send_json_request(
+        &broker_base_url,
+        "/v1/anthropic/messages",
+        large_json,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["received_size"].as_u64().unwrap() > 1000);
+    let first_chars = json["first_chars"].as_str().unwrap();
+    assert!(!first_chars.is_empty() && (first_chars.starts_with('{') || first_chars.starts_with('x')));
+
+    broker_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn https_connector_query_param_forwarding() {
+    let upstream = Router::new().route(
+        "/messages",
+        post(move |req: axum::extract::Request| async move {
+            let body = req.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&body).unwrap_or_default();
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                Body::from(
+                    json!({
+                        "id": "test_query",
+                        "model": payload.get("model").cloned(),
+                        "messages": payload.get("messages").cloned()
+                    })
+                    .to_string(),
+                ),
+            )
+        }),
+    );
+    let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
+
+    let config = Config::default();
+    let (broker_base_url, broker_server) =
+        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+
+    let response = send_json_request(
+        &broker_base_url,
+        "/v1/anthropic/messages",
+        json!({"model":"test","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["model"], "test");
+    assert_eq!(json["messages"][0]["role"], "user");
+    assert_eq!(json["messages"][0]["content"], "hi");
+
+    broker_server.abort();
+    upstream_server.abort();
+}
+
+#[tokio::test]
+async fn https_connector_custom_headers_forwarding() {
+    let upstream = Router::new().route(
+        "/messages",
+        post(move |req: axum::extract::Request| async move {
+            let headers = req.headers();
+            let trace_id = headers.get("x-trace-id").and_then(|v| v.to_str().ok());
+            let creavor_session = headers.get("x-creavor-session-id").and_then(|v| v.to_str().ok());
+            let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
+
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                Body::from(
+                    json!({
+                        "trace_id": trace_id,
+                        "creavor_session": creavor_session,
+                        "auth_present": auth_header.is_some(),
+                        "content_type": headers.get("content-type").and_then(|v| v.to_str().ok()),
+                        "other_present": headers.get("other-header").is_some()
+                    })
+                    .to_string(),
+                ),
+            )
+        }),
+    );
+    let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
+
+    let config = Config::default();
+    let (broker_base_url, broker_server) =
+        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+
+    let response = send_json_request_with_headers(
+        &broker_base_url,
+        "/v1/anthropic/messages",
+        json!({"model":"test","messages":[{"role":"user","content":"hi"}]}),
+        vec![
+            ("x-trace-id", "test-123-456"),
+            ("x-creavor-session-id", "session-abc"),
+            ("authorization", "Bearer test-token"),
+            ("content-type", "application/json"),
+            ("other-header", "should-be-kept"),
+        ],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["trace_id"], "test-123-456");
+    assert_eq!(json["creavor_session"], Value::Null); // x-creavor-session-id should be stripped
+    assert_eq!(json["auth_present"], true); // authorization should be passed through
+    assert_eq!(json["content_type"], "application/json");
+    assert_eq!(json["other_present"], true);
+
+    broker_server.abort();
+    upstream_server.abort();
+}
+
+async fn send_json_request_with_headers(
+    base_url: &str,
+    path: &str,
+    body: Value,
+    headers: Vec<(&str, &str)>,
+) -> hyper::Response<hyper::body::Incoming> {
+    let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
+    let mut request = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("{base_url}{path}"))
+        .header("content-type", "application/json");
+
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+
+    client
+        .request(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
