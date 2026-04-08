@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP=creavor
+REPO=opencreavor/opencreavor
+INSTALL_DIR=$HOME/.opencreavor/bin
+
+MUTED='\033[0;2m'
+RED='\033[0;31m'
+ORANGE='\033[38;5;214m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+usage() {
+cat <<EOF
+Usage: curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install | bash
+
+Options:
+-h, --help             Show this help message
+-v, --version VERSION  Install a specific version (e.g., 0.1.0)
+-b, --binary PATH      Install from local binaries instead of downloading
+--no-modify-path       Don't modify shell config files (.zshrc, .bashrc, etc.)
+
+Examples:
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install | bash
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install | bash -s -- --version 0.1.0
+  ./install --binary /path/to/creavor
+EOF
+}
+
+requested_version=${VERSION:-}
+no_modify_path=false
+binary_dir=""
+
+while [[ $# -gt 0 ]]; do
+case "$1" in
+-h|--help)
+  usage
+  exit 0
+  ;;
+-v|--version)
+  if [[ -n "${2:-}" ]]; then
+    requested_version="$2"
+    shift 2
+  else
+    echo -e "${RED}Error: --version requires a version argument${NC}" >&2
+    exit 1
+  fi
+  ;;
+-b|--binary)
+  if [[ -n "${2:-}" ]]; then
+    binary_dir="$2"
+    shift 2
+  else
+    echo -e "${RED}Error: --binary requires a directory argument${NC}" >&2
+    exit 1
+  fi
+  ;;
+--no-modify-path)
+  no_modify_path=true
+  shift
+  ;;
+*)
+  echo -e "${ORANGE}Warning: Unknown option '$1'${NC}" >&2
+  shift
+  ;;
+esac
+done
+
+print_message() {
+  local level=$1
+  local message=$2
+  local color=""
+  case $level in
+  info) color="${NC}" ;;
+  warning) color="${ORANGE}" ;;
+  error) color="${RED}" ;;
+  success) color="${GREEN}" ;;
+  esac
+  echo -e "${color}${message}${NC}"
+}
+
+# ---------------------------------------------------------------------------
+# OS / Arch detection
+# ---------------------------------------------------------------------------
+
+detect_platform() {
+  local raw_os=$(uname -s)
+  local os=$(echo "$raw_os" | tr '[:upper:]' '[:lower:]')
+
+  case "$raw_os" in
+  Darwin*) os="darwin" ;;
+  Linux*) os="linux" ;;
+  MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+  esac
+
+  local arch=$(uname -m)
+  if [[ "$arch" == "aarch64" ]]; then arch="arm64"; fi
+  if [[ "$arch" == "x86_64" ]]; then arch="x64"; fi
+
+  # Rosetta check on macOS
+  if [ "$os" = "darwin" ] && [ "$arch" = "x64" ]; then
+    local rosetta_flag=$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)
+    if [ "$rosetta_flag" = "1" ]; then arch="arm64"; fi
+  fi
+
+  local combo="$os-$arch"
+  case "$combo" in
+  linux-x64|linux-arm64|darwin-x64|darwin-arm64)
+    echo "$combo"
+    ;;
+  *)
+    echo -e "${RED}Unsupported OS/Arch: $os/$arch${NC}" >&2
+    exit 1
+    ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Build from source via cargo
+# ---------------------------------------------------------------------------
+
+build_from_source() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    print_message error "Error: 'cargo' is required but not installed."
+    print_message info "Install Rust: https://rustup.rs"
+    exit 1
+  fi
+
+  local version_flag=""
+  if [[ -n "$requested_version" ]]; then
+    version_flag="--tag v${requested_version}"
+  fi
+
+  print_message info "\n${MUTED}Building ${NC}${APP}${MUTED} from source...${NC}"
+
+  local tmp_dir="${TMPDIR:-/tmp}/opencreavor_build_$$"
+  mkdir -p "$tmp_dir"
+
+  git clone ${version_flag} --depth 1 https://github.com/${REPO}.git "$tmp_dir/repo" 2>&1 | \
+    while IFS= read -r line; do printf "\r${MUTED}%s${NC}" "$line"; done; echo
+
+  cargo build --release --manifest-path "$tmp_dir/repo/Cargo.toml" 2>&1 | \
+    while IFS= read -r line; do printf "\r${MUTED}%s${NC}" "$line"; done; echo
+
+  mkdir -p "$INSTALL_DIR"
+  cp "$tmp_dir/repo/target/release/creavor" "${INSTALL_DIR}/creavor"
+  cp "$tmp_dir/repo/target/release/broker-server" "${INSTALL_DIR}/broker-server"
+  chmod 755 "${INSTALL_DIR}/creavor" "${INSTALL_DIR}/broker-server"
+
+  rm -rf "$tmp_dir"
+
+  print_message success "Built and installed to ${INSTALL_DIR}"
+}
+
+# ---------------------------------------------------------------------------
+# Download prebuilt binary from GitHub releases
+# ---------------------------------------------------------------------------
+
+download_and_install() {
+  local platform=$(detect_platform)
+  local archive_ext=".tar.gz"
+  if [[ "$platform" == darwin-* ]]; then
+    archive_ext=".zip"
+  fi
+
+  local filename="${APP}-${platform}${archive_ext}"
+  local url
+  local specific_version
+
+  if [[ -z "$requested_version" ]]; then
+    url="https://github.com/${REPO}/releases/latest/download/${filename}"
+    specific_version=$(curl -s https://api.github.com/repos/${REPO}/releases/latest | \
+      sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+    if [[ -z "$specific_version" ]]; then
+      print_message error "Failed to fetch latest version. Falling back to build from source."
+      build_from_source
+      return
+    fi
+  else
+    requested_version="${requested_version#v}"
+    url="https://github.com/${REPO}/releases/download/v${requested_version}/${filename}"
+    specific_version="$requested_version"
+
+    local http_status=$(curl -sI -o /dev/null -w "%{http_code}" \
+      "https://github.com/${REPO}/releases/tag/v${requested_version}")
+    if [ "$http_status" = "404" ]; then
+      print_message warning "Release v${requested_version} not found. Falling back to build from source."
+      build_from_source
+      return
+    fi
+  fi
+
+  print_message info "\n${MUTED}Installing ${NC}${APP}${MUTED} version: ${NC}${specific_version}"
+
+  local tmp_dir="${TMPDIR:-/tmp}/opencreavor_install_$$"
+  mkdir -p "$tmp_dir"
+
+  print_message info "${MUTED}Downloading ${NC}${filename}..."
+  curl -# -L -o "$tmp_dir/$filename" "$url"
+
+  if [ "${platform%%-*}" = "linux" ]; then
+    tar -xzf "$tmp_dir/$filename" -C "$tmp_dir"
+  else
+    unzip -q "$tmp_dir/$filename" -d "$tmp_dir"
+  fi
+
+  mkdir -p "$INSTALL_DIR"
+  mv "$tmp_dir/creavor" "${INSTALL_DIR}/creavor" 2>/dev/null || true
+  mv "$tmp_dir/broker-server" "${INSTALL_DIR}/broker-server" 2>/dev/null || true
+  chmod 755 "${INSTALL_DIR}/creavor" "${INSTALL_DIR}/broker-server"
+
+  rm -rf "$tmp_dir"
+
+  print_message success "Installed to ${INSTALL_DIR}"
+}
+
+# ---------------------------------------------------------------------------
+# Install from local binaries
+# ---------------------------------------------------------------------------
+
+install_from_binary() {
+  if [[ ! -d "$binary_dir" ]]; then
+    echo -e "${RED}Error: Directory not found at ${binary_dir}${NC}" >&2
+    exit 1
+  fi
+
+  mkdir -p "$INSTALL_DIR"
+
+  if [[ -f "$binary_dir/creavor" ]]; then
+    cp "$binary_dir/creavor" "${INSTALL_DIR}/creavor"
+    chmod 755 "${INSTALL_DIR}/creavor"
+  else
+    echo -e "${RED}Error: 'creavor' binary not found in ${binary_dir}${NC}" >&2
+    exit 1
+  fi
+
+  if [[ -f "$binary_dir/broker-server" ]]; then
+    cp "$binary_dir/broker-server" "${INSTALL_DIR}/broker-server"
+    chmod 755 "${INSTALL_DIR}/broker-server"
+  else
+    print_message warning "broker-server not found in ${binary_dir}, skipping"
+  fi
+
+  print_message success "Installed from ${binary_dir}"
+}
+
+# ---------------------------------------------------------------------------
+# PATH configuration
+# ---------------------------------------------------------------------------
+
+add_to_path() {
+  local config_file=$1
+  local command=$2
+
+  if grep -Fxq "$command" "$config_file"; then
+    print_message info "${MUTED}Command already exists in ${NC}${config_file}${MUTED}, skipping.${NC}"
+  elif [[ -w $config_file ]]; then
+    echo -e "\n# opencreavor" >> "$config_file"
+    echo "$command" >> "$config_file"
+    print_message info "${MUTED}Added ${NC}${APP}${MUTED} to \$PATH in ${NC}${config_file}"
+  else
+    print_message warning "Manually add to ${config_file}:"
+    print_message info "  ${command}"
+  fi
+}
+
+configure_path() {
+  if [[ "$no_modify_path" == "true" ]]; then return; fi
+  if [[ ":$PATH:" == *":$INSTALL_DIR:"* ]]; then
+    print_message info "${MUTED}${INSTALL_DIR} already in PATH${NC}"
+    return
+  fi
+
+  local current_shell=$(basename "${SHELL:-}")
+  local config_files=""
+
+  case $current_shell in
+  fish) config_files="$HOME/.config/fish/config.fish" ;;
+  zsh)  config_files="${ZDOTDIR:-$HOME}/.zshrc ${ZDOTDIR:-$HOME}/.zshenv" ;;
+  bash) config_files="$HOME/.bashrc $HOME/.bash_profile $HOME/.profile" ;;
+  ash|sh) config_files="$HOME/.profile" ;;
+  *)    config_files="$HOME/.bashrc $HOME/.bash_profile" ;;
+  esac
+
+  local config_file=""
+  for file in $config_files; do
+    if [[ -f $file ]]; then
+      config_file=$file
+      break
+    fi
+  done
+
+  if [[ -z $config_file ]]; then
+    print_message warning "No shell config found for ${current_shell}. Add to PATH manually:"
+    print_message info "  export PATH=${INSTALL_DIR}:\$PATH"
+    return
+  fi
+
+  case $current_shell in
+  fish) add_to_path "$config_file" "fish_add_path ${INSTALL_DIR}" ;;
+  *)    add_to_path "$config_file" "export PATH=${INSTALL_DIR}:\$PATH" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+mkdir -p "$INSTALL_DIR"
+
+if [[ -n "$binary_dir" ]]; then
+  install_from_binary
+else
+  download_and_install
+fi
+
+configure_path
+
+# GitHub Actions support
+if [[ -n "${GITHUB_ACTIONS-}" ]] && [[ "${GITHUB_ACTIONS}" == "true" ]]; then
+  echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+  print_message info "Added ${INSTALL_DIR} to \$GITHUB_PATH"
+fi
+
+# Banner
+echo ""
+echo -e "${MUTED}  █▀▀▄ █▀▀█ █▀▀█ █▀▀▄ █${NC}  ${MUTED}▄▀▀▄ █▀▀█ █▀▀█ █▀▀█ █▀▀█${NC}"
+echo -e "${MUTED}  █░░█ █░░█ █▀▀▀ █░░█ █${NC}  ${MUTED}█░░█ █▀▀▀ █░░█ █▀▀▀ █░░█${NC}"
+echo -e "${MUTED}  ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀ ▀ ▀${NC}  ${MUTED}█▄▄█ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ █▀▀▀${NC}"
+echo ""
+echo -e "${MUTED}Installed:${NC}"
+echo -e "  ${GREEN}creavor${NC}        ${MUTED}CLI tool to launch AI runtimes through the broker${NC}"
+echo -e "  ${GREEN}broker-server${NC}  ${MUTED}Local interception proxy for AI coding runtimes${NC}"
+echo ""
+echo -e "${MUTED}Quick start:${NC}"
+echo -e "  ${MUTED}1.${NC} broker-server ${MUTED}# Start the broker${NC}"
+echo -e "  ${MUTED}2.${NC} creavor run claude ${MUTED}# Launch Claude Code through the broker${NC}"
+echo ""
+echo -e "${MUTED}Supported runtimes: claude, gemini, codex, opencode, openclaw, cline${NC}"
+echo -e "${MUTED}Docs: https://github.com/${REPO}${NC}"
+echo ""
