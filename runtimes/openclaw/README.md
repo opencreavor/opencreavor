@@ -1,34 +1,35 @@
 # OpenClaw Runtime Setup
 
-## 1) Configure OpenAI-compatible endpoint
+## Quick Start
 
-Use env or config to point OpenClaw to broker:
+```bash
+# Launch OpenClaw through the broker
+creavor run openclaw
+```
+
+`creavor run openclaw` will:
+1. Read the current `OPENAI_BASE_URL` env var
+2. Save the original URL to `~/.opencreavor/settings.json` as upstream
+3. Set `OPENAI_BASE_URL` to the broker proxy URL
+4. Launch `openclaw` with the broker as proxy
+
+## Permanent Configuration
+
+```bash
+# Print the OPENAI_BASE_URL export command
+creavor config openclaw
+```
+
+## Manual Setup (Advanced)
 
 ```bash
 export OPENAI_BASE_URL="http://127.0.0.1:8765/v1/openai"
-```
-
-Inject session id at startup (wrapper script):
-
-```bash
 export CREAVOR_SESSION_ID="openclaw:$(uuidgen | cut -d'-' -f1):$(date -u +%Y%m%dT%H%M)"
-export OPENAI_CUSTOM_HEADERS="X-Creavor-Session-Id:${CREAVOR_SESSION_ID}"
-```
-
-## 2) Local events auth token
-
-```bash
-export CREAVOR_BROKER_EVENT_TOKEN="$(openssl rand -hex 32)"
-```
-
-Hook events must include:
-
-```http
-Authorization: Bearer <CREAVOR_BROKER_EVENT_TOKEN>
+openclaw
 ```
 
 ## Notes
 
 - If custom headers are unsupported, broker will fallback to fuzzy correlation.
 - Broker block responses are OpenAI-compatible by default with HTTP `400`.
-- Stream behavior is controlled by broker config (`stream_passthrough`, `upstream_timeout`, `idle_stream_timeout`).
+- Stream controls: `stream_passthrough`, `upstream_timeout_secs`, `idle_stream_timeout_secs`.

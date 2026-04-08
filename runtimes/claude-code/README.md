@@ -1,36 +1,39 @@
 # Claude Code Runtime Setup
 
-Use a startup wrapper so session metadata is injected at process start.
-Do not rely on hook scripts to mutate parent shell environment.
-
-## 1) Set broker endpoint and session header
+## Quick Start
 
 ```bash
-export CREAVOR_SESSION_ID="claude-code:$(uuidgen | cut -d'-' -f1):$(date -u +%Y%m%dT%H%M)"
+# Launch Claude Code through the broker
+creavor run claude
+```
+
+`creavor run claude` will:
+1. Read Claude's current `apiBaseUrl` from `~/.claude/settings.json`
+2. Save the original URL to `~/.opencreavor/settings.json` as upstream
+3. Set `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS` env vars
+4. Launch `claude` with the broker as proxy
+
+## Permanent Configuration
+
+```bash
+# Write broker URL into Claude's settings permanently
+creavor config claude
+```
+
+After this, Claude will use the broker even when launched directly (without `creavor run`).
+
+## Manual Setup (Advanced)
+
+If you prefer to configure manually:
+
+```bash
 export ANTHROPIC_BASE_URL="http://127.0.0.1:8765/v1/anthropic"
-export ANTHROPIC_CUSTOM_HEADERS="X-Creavor-Session-Id:${CREAVOR_SESSION_ID}"
-```
-
-## 2) Start Claude Code from the same shell
-
-```bash
+export ANTHROPIC_CUSTOM_HEADERS="X-Creavor-Session-Id:claude:$(uuidgen | cut -d'-' -f1):$(date -u +%Y%m%dT%H%M)"
 claude
-```
-
-## 3) Configure local event auth token for hooks
-
-```bash
-export CREAVOR_BROKER_EVENT_TOKEN="$(openssl rand -hex 32)"
-```
-
-When posting to `POST /api/v1/events`, include:
-
-```http
-Authorization: Bearer <CREAVOR_BROKER_EVENT_TOKEN>
 ```
 
 ## Notes
 
 - Broker strips `X-Creavor-Session-Id` before forwarding upstream.
-- Block responses are provider-compatible and default to HTTP `400`.
-- Stream controls are configured by broker settings: `stream_passthrough`, `upstream_timeout`, `idle_stream_timeout`.
+- Block responses use Anthropic-compatible envelope with HTTP `400`.
+- Stream controls: `stream_passthrough`, `upstream_timeout_secs`, `idle_stream_timeout_secs` in `~/.opencreavor/settings.json`.
