@@ -1,11 +1,11 @@
 use crate::{
-    config::Config,
+    config::Settings,
     events::{post_events, EventsState},
     interceptor::{
-        anthropic_block_response_with_status, openai_block_response_with_status,
-        strip_session_header,
+        anthropic_block_response_with_status, gemini_block_response_with_status,
+        openai_block_response_with_status, strip_creavor_headers,
     },
-    proxy::{forward_upstream, BoxError, ProxyTimeouts, UpstreamResponse},
+    proxy::{forward_upstream, BoxError, ProxyTimeouts, TerminalReason, UpstreamResponse},
     rule_engine::{scan_request, RuleSet},
     storage::AuditStorage,
 };
@@ -23,6 +23,10 @@ use hyper_util::{
     client::legacy::Client,
     rt::TokioExecutor,
 };
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 const CONTENT_LENGTH: HeaderName = HeaderName::from_static("content-length");
 const HOST: HeaderName = HeaderName::from_static("host");
@@ -31,26 +35,67 @@ const HOST: HeaderName = HeaderName::from_static("host");
 pub enum Provider {
     Anthropic,
     OpenAI,
+    Gemini,
 }
 
 pub fn provider_for_path(path: &str) -> Option<Provider> {
-    if path == "/v1/anthropic" || path.starts_with("/v1/anthropic/") {
+    if path.starts_with("/v1/anthropic") {
         return Some(Provider::Anthropic);
     }
-
-    if path == "/v1/openai" || path.starts_with("/v1/openai/") {
+    if path.starts_with("/v1/openai") {
         return Some(Provider::OpenAI);
     }
-
+    if path.starts_with("/v1/gemini") {
+        return Some(Provider::Gemini);
+    }
     None
 }
 
-pub fn app(config: Config, storage: AuditStorage) -> Router {
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Anthropic => "anthropic",
+        Provider::OpenAI => "openai",
+        Provider::Gemini => "gemini",
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    settings: Settings,
+    rules: RuleSet,
+    storage: Arc<Mutex<AuditStorage>>,
+    client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
+}
+
+pub fn app(settings: Settings, storage: AuditStorage) -> Router {
+    let shared_storage = Arc::new(Mutex::new(storage));
+    let client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body> =
+        Client::builder(TokioExecutor::new()).build(HttpsConnector::new());
+
+    let events_state =
+        EventsState::new(settings.audit.event_auth_token.clone(), shared_storage.clone());
+    let state = AppState {
+        settings,
+        rules: RuleSet::builtin(),
+        storage: shared_storage,
+        client,
+    };
+
     Router::new()
-        .route("/", get(health))
-        .route("/health", get(health))
         .route("/api/v1/events", post(post_events))
-        .with_state(EventsState::new(config.audit.event_auth_token, storage))
+        .with_state(events_state)
+        .merge(
+            Router::new()
+                .route("/", get(health))
+                .route("/health", get(health))
+                .route("/v1/openai", post(proxy_request))
+                .route("/v1/openai/{*path}", post(proxy_request))
+                .route("/v1/anthropic", post(proxy_request))
+                .route("/v1/anthropic/{*path}", post(proxy_request))
+                .route("/v1/gemini", post(proxy_request))
+                .route("/v1/gemini/{*path}", post(proxy_request))
+                .with_state(state),
+        )
 }
 
 async fn health() -> Response<Body> {
@@ -61,120 +106,199 @@ async fn health() -> Response<Body> {
         .expect("health response should be valid")
 }
 
-#[derive(Clone)]
-struct ProxyState {
-    config: Config,
-    rules: RuleSet,
-    upstream_base_url: String,
-    client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
-}
-
-pub fn proxy_app(config: Config, upstream_base_url: String) -> Router {
-    let client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body> =
-        Client::builder(TokioExecutor::new()).build(
-            HttpsConnector::new()
-        );
-
-    Router::new()
-        .route("/v1/openai", post(proxy_request))
-        .route("/v1/openai/{*path}", post(proxy_request))
-        .route("/v1/anthropic", post(proxy_request))
-        .route("/v1/anthropic/{*path}", post(proxy_request))
-        .with_state(ProxyState {
-            config,
-            rules: RuleSet::builtin(),
-            upstream_base_url,
-            client,
-        })
-}
-
-async fn proxy_request(State(state): State<ProxyState>, request: Request) -> Response<Body> {
+async fn proxy_request(State(state): State<AppState>, request: Request) -> Response<Body> {
     let provider = match provider_for_path(request.uri().path()) {
-        Some(provider) => provider,
+        Some(p) => p,
         None => return terminal_response(StatusCode::NOT_FOUND),
+    };
+
+    // 1. Read headers
+    let runtime = request
+        .headers()
+        .get("x-creavor-runtime")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let session_id = request
+        .headers()
+        .get("x-creavor-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // 2. Resolve upstream from settings
+    let upstream_base = match state.settings.get_upstream(&runtime) {
+        Some(url) => url.to_string(),
+        None => {
+            tracing::error!(runtime = %runtime, "no upstream configured for runtime");
+            return terminal_response(StatusCode::BAD_GATEWAY);
+        }
     };
 
     let method = request.method().clone();
     let request_path = request.uri().path().to_owned();
-    let upstream_uri = upstream_uri(&state.upstream_base_url, provider, request.uri());
+    let upstream_uri = upstream_uri(&upstream_base, provider, request.uri());
 
     tracing::info!(
         method = %method,
         path = %request_path,
         upstream = %upstream_uri,
-        provider = ?provider,
-        "proxy request received"
+        runtime = %runtime,
+        "proxy request"
     );
 
+    // 3. Strip Creavor headers before forwarding
     let mut headers = request.headers().clone();
-    strip_session_header(&mut headers);
+    strip_creavor_headers(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
 
+    // 4. Read request body
     let request_body = request.into_body().collect().await.unwrap().to_bytes();
     let request_body_text = String::from_utf8(request_body.to_vec()).unwrap();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let start = Instant::now();
 
+    // 5. Rule scan
     if let Some(rule_match) = scan_request(&request_body_text, &state.rules) {
         tracing::warn!(
             rule = %rule_match.rule_name,
-            path = %request_path,
-            "request blocked by rule engine"
+            runtime = %runtime,
+            "request blocked"
         );
         let message = format!(
             "Blocked by Creavor broker: {} ({})",
             rule_match.rule_name, rule_match.matched_content_sanitized
         );
-        return block_response(provider, &state.config, &message);
+
+        // Write audit for blocked request
+        if let Ok(storage) = state.storage.lock() {
+            let _ = storage.insert_request_start(
+                &request_id,
+                session_id.as_deref(),
+                &runtime,
+                provider_name(provider),
+                method.as_str(),
+                &request_path,
+                true,
+                Some(&message),
+                Some(&rule_match.rule_id),
+                Some(&rule_match.severity),
+            );
+            let _ = storage.insert_violation(
+                &request_id,
+                &rule_match.rule_id,
+                &rule_match.rule_name,
+                &rule_match.severity,
+                &rule_match.matched_content_sanitized,
+                "blocked",
+            );
+            let latency = start.elapsed().as_millis() as i64;
+            let _ = storage.finalize_request(
+                &request_id,
+                TerminalReason::Ok,
+                Some(state.settings.broker.block_status_code),
+                Some(latency),
+            );
+        }
+
+        return block_response(provider, &state.settings, &message);
     }
 
-    let upstream_request = upstream_request(method.clone(), upstream_uri.clone(), headers, request_body_text.clone());
-    if state.config.broker.stream_passthrough {
+    // 6. Write audit for allowed request
+    if let Ok(storage) = state.storage.lock() {
+        let _ = storage.insert_request_start(
+            &request_id,
+            session_id.as_deref(),
+            &runtime,
+            provider_name(provider),
+            method.as_str(),
+            &request_path,
+            false,
+            None,
+            None,
+            None,
+        );
+        if state.settings.audit.store_request_payloads {
+            let _ = storage.insert_request_payload(&request_id, &request_body_text);
+        }
+    }
+
+    // 7. Forward upstream
+    let upstream_request =
+        build_upstream_request(method.clone(), upstream_uri.clone(), headers, request_body_text.clone());
+
+    if state.settings.broker.stream_passthrough {
         let forwarded = forward_upstream(
-            upstream_response(state.client.clone(), upstream_request),
+            send_upstream(state.client.clone(), upstream_request),
             ProxyTimeouts::new(
-                state.config.broker.upstream_timeout,
-                state.config.broker.idle_stream_timeout,
+                Duration::from_secs(state.settings.broker.upstream_timeout_secs),
+                Duration::from_secs(state.settings.broker.idle_stream_timeout_secs),
             ),
         )
         .await;
+        let status = forwarded.response.status();
+        let latency = start.elapsed().as_millis() as i64;
+        if let Ok(storage) = state.storage.lock() {
+            let _ = storage.finalize_request(
+                &request_id,
+                TerminalReason::Ok,
+                Some(status.as_u16()),
+                Some(latency),
+            );
+        }
         tracing::info!(
-            method = %method,
             path = %request_path,
-            status = %forwarded.response.status(),
-            "proxy request completed (streaming)"
+            status = %status,
+            latency_ms = latency,
+            "proxy completed (streaming)"
         );
         return forwarded.response;
     }
 
+    // Buffered mode
     match state.client.request(upstream_request).await {
         Ok(upstream_response) => {
+            let status = upstream_response.status();
+            let latency = start.elapsed().as_millis() as i64;
+            if let Ok(storage) = state.storage.lock() {
+                let _ = storage.finalize_request(
+                    &request_id,
+                    TerminalReason::Ok,
+                    Some(status.as_u16()),
+                    Some(latency),
+                );
+            }
             tracing::info!(
-                method = %method,
                 path = %request_path,
-                status = %upstream_response.status(),
-                "proxy request completed (buffered)"
+                status = %status,
+                latency_ms = latency,
+                "proxy completed (buffered)"
             );
             buffered_response(upstream_response).await
         }
         Err(e) => {
-            tracing::error!(
-                method = %method,
-                path = %request_path,
-                upstream = %upstream_uri,
-                error = %e,
-                "upstream request failed"
-            );
+            tracing::error!(path = %request_path, error = %e, "upstream failed");
+            if let Ok(storage) = state.storage.lock() {
+                let latency = start.elapsed().as_millis() as i64;
+                let _ = storage.finalize_request(
+                    &request_id,
+                    TerminalReason::NetworkError,
+                    None,
+                    Some(latency),
+                );
+            }
             terminal_response(StatusCode::BAD_GATEWAY)
         }
     }
 }
 
-fn block_response(provider: Provider, config: &Config, message: &str) -> Response<Body> {
+fn block_response(provider: Provider, settings: &Settings, message: &str) -> Response<Body> {
     let status =
-        StatusCode::from_u16(config.broker.block_status_code).unwrap_or(StatusCode::BAD_REQUEST);
+        StatusCode::from_u16(settings.broker.block_status_code).unwrap_or(StatusCode::BAD_REQUEST);
     match provider {
         Provider::Anthropic => anthropic_block_response_with_status(status, message),
         Provider::OpenAI => openai_block_response_with_status(status, message),
+        Provider::Gemini => gemini_block_response_with_status(status, message),
     }
 }
 
@@ -182,6 +306,7 @@ fn upstream_uri(base_url: &str, provider: Provider, uri: &Uri) -> String {
     let prefix = match provider {
         Provider::Anthropic => "/v1/anthropic",
         Provider::OpenAI => "/v1/openai",
+        Provider::Gemini => "/v1/gemini",
     };
     let path_and_query = uri
         .path_and_query()
@@ -193,7 +318,12 @@ fn upstream_uri(base_url: &str, provider: Provider, uri: &Uri) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), suffix)
 }
 
-fn upstream_request(method: axum::http::Method, uri: String, headers: HeaderMap, body: String) -> Request {
+fn build_upstream_request(
+    method: axum::http::Method,
+    uri: String,
+    headers: HeaderMap,
+    body: String,
+) -> Request {
     let mut request = Request::builder()
         .method(method)
         .uri(uri)
@@ -203,24 +333,19 @@ fn upstream_request(method: axum::http::Method, uri: String, headers: HeaderMap,
     request
 }
 
-async fn upstream_response(
+async fn send_upstream(
     client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
     request: Request,
 ) -> Result<UpstreamResponse, BoxError> {
     let upstream_response = client.request(request).await.map_err(box_error)?;
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
-    let body = upstream_response
-        .into_body()
-        .into_data_stream()
-        .map_err(box_error);
+    let body = upstream_response.into_body().into_data_stream().map_err(box_error);
 
     Ok(UpstreamResponse::new(status, headers, body))
 }
 
-async fn buffered_response(
-    upstream_response: hyper::Response<hyper::body::Incoming>,
-) -> Response<Body> {
+async fn buffered_response(upstream_response: hyper::Response<hyper::body::Incoming>) -> Response<Body> {
     let status = upstream_response.status();
     let headers = upstream_response.headers().clone();
     let bytes = upstream_response
@@ -299,8 +424,8 @@ mod tests {
             .unwrap()
     }
 
-    async fn spawn_app(config: Config, storage: AuditStorage) -> (String, JoinHandle<()>) {
-        let app = app(config, storage);
+    async fn spawn_app(settings: Settings, storage: AuditStorage) -> (String, JoinHandle<()>) {
+        let app = app(settings, storage);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
@@ -310,16 +435,16 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    fn test_config() -> Config {
-        let mut config = Config::default();
-        config.audit.event_auth_token = Some("local-events-secret".to_string());
-        config
+    fn test_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.audit.event_auth_token = Some("local-events-secret".to_string());
+        settings
     }
 
-    fn blank_token_config() -> Config {
-        let mut config = Config::default();
-        config.audit.event_auth_token = Some("   ".to_string());
-        config
+    fn blank_token_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.audit.event_auth_token = Some("   ".to_string());
+        settings
     }
 
     fn unique_temp_path(name: &str) -> PathBuf {
@@ -335,7 +460,7 @@ mod tests {
         storage
             .connection()
             .query_row(
-                "SELECT event_type, request_id, payload
+                "SELECT event_type, session_id, payload
                  FROM events
                  ORDER BY id DESC
                  LIMIT 1",
@@ -369,8 +494,23 @@ mod tests {
     }
 
     #[test]
+    fn routes_gemini_paths_to_gemini() {
+        assert_eq!(
+            provider_for_path("/v1/gemini/generateContent"),
+            Some(Provider::Gemini)
+        );
+    }
+
+    #[test]
     fn ignores_unknown_paths() {
         assert_eq!(provider_for_path("/v1/other/messages"), None);
+    }
+
+    #[test]
+    fn provider_name_returns_correct_string() {
+        assert_eq!(provider_name(Provider::Anthropic), "anthropic");
+        assert_eq!(provider_name(Provider::OpenAI), "openai");
+        assert_eq!(provider_name(Provider::Gemini), "gemini");
     }
 
     #[test]
@@ -383,11 +523,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_upstream_uri_strips_gemini_prefix() {
+        let uri = Uri::from_static("/v1/gemini/models/gemini-pro:generateContent");
+
+        assert_eq!(
+            upstream_uri("https://generativelanguage.googleapis.com", Provider::Gemini, &uri),
+            "https://generativelanguage.googleapis.com/models/gemini-pro:generateContent"
+        );
+    }
+
     #[tokio::test]
     async fn events_missing_token_returns_unauthorized() {
         let path = unique_temp_path("missing-token");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_events_request(
             &base_url,
@@ -406,7 +556,7 @@ mod tests {
     async fn events_invalid_token_returns_unauthorized() {
         let path = unique_temp_path("invalid-token");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_events_request(
             &base_url,
@@ -425,7 +575,7 @@ mod tests {
     async fn events_blank_configured_token_still_rejects_bearer_request() {
         let path = unique_temp_path("blank-token");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(blank_token_config(), storage).await;
+        let (base_url, server) = spawn_app(blank_token_settings(), storage).await;
 
         let response = send_events_request(
             &base_url,
@@ -444,7 +594,7 @@ mod tests {
     async fn events_valid_token_returns_accepted_and_persists_sanitized_payload() {
         let path = unique_temp_path("valid-token");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_events_request(
             &base_url,
@@ -473,7 +623,7 @@ mod tests {
     async fn events_prefer_session_header_for_correlation_and_do_not_store_auth_token() {
         let path = unique_temp_path("session-correlation");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_events_request(
             &base_url,
@@ -505,7 +655,7 @@ mod tests {
     async fn events_fallback_correlation_uses_runtime_bucket_and_cwd() {
         let path = unique_temp_path("fallback-correlation");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_events_request(
             &base_url,
@@ -539,7 +689,7 @@ mod tests {
     async fn events_rate_limit_returns_too_many_requests() {
         let path = unique_temp_path("rate-limit");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         for _ in 0..32 {
             let response = send_events_request(
@@ -569,7 +719,7 @@ mod tests {
     async fn events_rate_limit_isolated_between_distinct_correlation_keys() {
         let path = unique_temp_path("rate-limit-isolated");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         for _ in 0..32 {
             let response = send_events_request(
@@ -595,9 +745,12 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
-    // ── Health endpoint tests ──────────────────────────────────────────
+    // -- Health endpoint tests --
 
-    async fn send_health_request(base_url: &str, path: &str) -> hyper::Response<hyper::body::Incoming> {
+    async fn send_health_request(
+        base_url: &str,
+        path: &str,
+    ) -> hyper::Response<hyper::body::Incoming> {
         let client: Client<HttpConnector, Body> =
             Client::builder(TokioExecutor::new()).build_http();
         client
@@ -615,7 +768,7 @@ mod tests {
     async fn health_root_returns_ok() {
         let path = unique_temp_path("health-root");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_health_request(&base_url, "/").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -633,7 +786,7 @@ mod tests {
     async fn health_explicit_path_returns_ok() {
         let path = unique_temp_path("health-path");
         let storage = AuditStorage::open(&path).unwrap();
-        let (base_url, server) = spawn_app(test_config(), storage).await;
+        let (base_url, server) = spawn_app(test_settings(), storage).await;
 
         let response = send_health_request(&base_url, "/health").await;
         assert_eq!(response.status(), StatusCode::OK);

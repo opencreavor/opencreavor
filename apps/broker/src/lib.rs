@@ -9,37 +9,35 @@ pub mod storage;
 
 pub async fn run() -> anyhow::Result<()> {
     let config_path = parse_config_path(std::env::args().skip(1))?;
-    let config = match config_path {
-        Some(path) => config::Config::load(path)?,
-        None => config::Config::default(),
+    let settings = match config_path {
+        Some(path) => config::Settings::load(path)?,
+        None => config::Settings::load_or_default(),
     };
 
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&config.broker.log_level)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&settings.broker.log_level)),
         )
         .init();
 
     let db_path = std::env::var("CREAVOR_BROKER_DB_PATH")
         .unwrap_or_else(|_| "/tmp/creavor-broker.sqlite".to_string());
-    let upstream_base_url = std::env::var("CREAVOR_UPSTREAM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+
+    let port = settings.broker.port;
 
     tracing::info!(
-        port = config.broker.port,
-        upstream = %upstream_base_url,
-        "starting creavor-broker"
+        port = port,
+        upstream_count = settings.upstream.len(),
+        "starting broker-server"
     );
 
     let storage = storage::AuditStorage::open(db_path)?;
-    let events_app = router::app(config.clone(), storage);
-    let proxy_app = router::proxy_app(config.clone(), upstream_base_url);
-    let app = events_app.merge(proxy_app);
+    let app = router::app(settings, storage);
 
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], config.broker.port));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("creavor-broker listening on http://{addr}");
+    tracing::info!("broker-server listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }

@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use creavor_broker::{config::Config, router::app, storage::AuditStorage};
+use creavor_broker::{config::Settings, router::app, storage::AuditStorage};
 use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -26,11 +26,11 @@ fn unique_temp_path(name: &str) -> PathBuf {
     env::temp_dir().join(format!("creavor-broker-events-auth-{name}-{nanos}.sqlite"))
 }
 
-async fn spawn_http_app(config: Config, storage: AuditStorage) -> (String, JoinHandle<()>) {
+async fn spawn_http_app(settings: Settings, storage: AuditStorage) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app(config, storage)).await.unwrap();
+        axum::serve(listener, app(settings, storage)).await.unwrap();
     });
 
     (format!("http://{addr}"), handle)
@@ -61,7 +61,7 @@ fn persisted_events(path: &PathBuf) -> Vec<(String, Option<String>, String)> {
     let connection = Connection::open(path).unwrap();
     let mut statement = connection
         .prepare(
-            "SELECT event_type, request_id, payload
+            "SELECT event_type, session_id, payload
              FROM events
              ORDER BY id ASC",
         )
@@ -84,9 +84,9 @@ fn persisted_events(path: &PathBuf) -> Vec<(String, Option<String>, String)> {
 async fn p0_event_ingestion_requires_valid_bearer_token_before_persisting() {
     let path = unique_temp_path("acceptance");
     let storage = AuditStorage::open(&path).unwrap();
-    let mut config = Config::default();
-    config.audit.event_auth_token = Some("local-events-secret".to_string());
-    let (base_url, server) = spawn_http_app(config, storage).await;
+    let mut settings = Settings::default();
+    settings.audit.event_auth_token = Some("local-events-secret".to_string());
+    let (base_url, server) = spawn_http_app(settings, storage).await;
 
     let unauthorized = send_events_request(
         &base_url,

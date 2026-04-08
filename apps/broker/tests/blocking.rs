@@ -1,5 +1,5 @@
 use axum::{body::Body, http::StatusCode, routing::post, Router};
-use creavor_broker::{config::Config, router};
+use creavor_broker::{config::Settings, router, storage::AuditStorage};
 use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -7,6 +7,7 @@ use hyper_util::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -42,7 +43,7 @@ async fn spawn_http_app(app: Router) -> (String, JoinHandle<()>) {
     (format!("http://{addr}"), handle)
 }
 
-async fn send_json_request(base_url: &str, path: &str, body: Value) -> hyper::Response<hyper::body::Incoming> {
+async fn send_json_request(base_url: &str, path: &str, body: Value, runtime: &str) -> hyper::Response<hyper::body::Incoming> {
     let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
     client
         .request(
@@ -50,6 +51,7 @@ async fn send_json_request(base_url: &str, path: &str, body: Value) -> hyper::Re
                 .method("POST")
                 .uri(format!("{base_url}{path}"))
                 .header("content-type", "application/json")
+                .header("x-creavor-runtime", runtime)
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
@@ -63,10 +65,13 @@ async fn p0_blocked_secret_request_returns_provider_block_and_skips_upstream() {
     let (upstream_base_url, upstream_server) =
         spawn_http_app(upstream_app(upstream_call_count.clone())).await;
 
-    let mut config = Config::default();
-    config.broker.block_status_code = 451;
+    let mut settings = Settings::default();
+    settings.broker.block_status_code = 451;
+    settings.broker.stream_passthrough = false;
+    settings.upstream = HashMap::from([("test-runtime".to_string(), upstream_base_url)]);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -75,6 +80,7 @@ async fn p0_blocked_secret_request_returns_provider_block_and_skips_upstream() {
             "model": "gpt-5",
             "input": "My key is sk-1234567890abcdef123456"
         }),
+        "test-runtime",
     )
     .await;
 
@@ -87,7 +93,7 @@ async fn p0_blocked_secret_request_returns_provider_block_and_skips_upstream() {
                 "message": "Blocked by Creavor broker: OpenAI API Key (sk-***456)",
                 "type": "invalid_request_error",
                 "param": Value::Null,
-                "code": Value::Null,
+                "code": "content_policy_violation",
             }
         })
     );

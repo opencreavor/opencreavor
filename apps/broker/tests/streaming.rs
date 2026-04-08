@@ -5,7 +5,7 @@ use axum::{
     routing::post,
     Router,
 };
-use creavor_broker::{config::Config, router};
+use creavor_broker::{config::Settings, router, storage::AuditStorage};
 use futures_core::Stream;
 use futures_util::FutureExt;
 use http_body_util::BodyExt;
@@ -15,7 +15,9 @@ use hyper_util::{
 };
 use serde_json::json;
 use std::{
+    collections::HashMap,
     future::Future,
+    net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll},
@@ -115,7 +117,7 @@ fn upstream_app(release_second: oneshot::Receiver<()>) -> Router {
 
 async fn spawn_http_app(app: Router) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -131,6 +133,7 @@ async fn send_stream_request(base_url: &str) -> hyper::Response<hyper::body::Inc
                 .method("POST")
                 .uri(format!("{base_url}/v1/openai/stream"))
                 .header("content-type", "application/json")
+                .header("x-creavor-runtime", "test-runtime")
                 .body(Body::from(json!({"input":"hello"}).to_string()))
                 .unwrap(),
         )
@@ -144,10 +147,12 @@ async fn p0_allowed_streaming_request_passthroughs_sse_chunks() {
     let (upstream_base_url, upstream_server) =
         spawn_http_app(upstream_app(release_second_rx)).await;
 
-    let mut config = Config::default();
-    config.broker.stream_passthrough = true;
+    let mut settings = Settings::default();
+    settings.broker.stream_passthrough = true;
+    settings.upstream = HashMap::from([("test-runtime".to_string(), upstream_base_url)]);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_stream_request(&broker_base_url).await;
     assert_eq!(response.status(), StatusCode::OK);

@@ -1,5 +1,5 @@
 use axum::{body::Body, http::StatusCode, routing::post, Router};
-use creavor_broker::{config::Config, router};
+use creavor_broker::{config::Settings, router, storage::AuditStorage};
 use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
@@ -7,6 +7,7 @@ use hyper_util::{
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -67,11 +68,19 @@ async fn send_json_request(
                 .method("POST")
                 .uri(format!("{base_url}{path}"))
                 .header("content-type", "application/json")
+                .header("x-creavor-runtime", "test-runtime")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap()
+}
+
+fn broker_settings(upstream_base_url: String) -> Settings {
+    let mut settings = Settings::default();
+    settings.broker.stream_passthrough = false;
+    settings.upstream = HashMap::from([("test-runtime".to_string(), upstream_base_url)]);
+    settings
 }
 
 #[tokio::test]
@@ -80,9 +89,10 @@ async fn https_connector_forwards_to_http_upstream() {
     let (upstream_base_url, upstream_server) =
         spawn_http_app(upstream_app(upstream_call_count.clone())).await;
 
-    let config = Config::default();
+    let settings = broker_settings(upstream_base_url);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -113,9 +123,10 @@ async fn https_connector_forwards_openai_path() {
     let (upstream_base_url, upstream_server) =
         spawn_http_app(upstream_app(upstream_call_count.clone())).await;
 
-    let config = Config::default();
+    let settings = broker_settings(upstream_base_url);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -136,13 +147,12 @@ async fn https_connector_forwards_openai_path() {
 
 #[tokio::test]
 async fn https_connector_upstream_unreachable_returns_502() {
-    let config = Config::default();
+    let mut settings = Settings::default();
+    settings.broker.stream_passthrough = false;
+    settings.upstream = HashMap::from([("test-runtime".to_string(), "http://127.0.0.1:1".to_string())]);
+    let storage = AuditStorage::open_in_memory().unwrap();
     // Point upstream to a port that nobody listens on
-    let (broker_base_url, broker_server) = spawn_http_app(router::proxy_app(
-        config,
-        "http://127.0.0.1:1".to_string(),
-    ))
-    .await;
+    let (broker_base_url, broker_server) = spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -180,9 +190,10 @@ async fn https_connector_preserves_upstream_headers() {
     );
     let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
 
-    let config = Config::default();
+    let settings = broker_settings(upstream_base_url);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -224,10 +235,11 @@ async fn https_connector_streaming_passthrough_forwards_chunks() {
     );
     let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
 
-    let mut config = Config::default();
-    config.broker.stream_passthrough = true;
+    let mut settings = broker_settings(upstream_base_url);
+    settings.broker.stream_passthrough = true;
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -254,9 +266,11 @@ async fn https_connector_streaming_passthrough_forwards_chunks() {
 
 #[tokio::test]
 async fn https_connector_get_request_405() {
-    let config = Config::default();
-    let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, "http://127.0.0.1:8080".to_string())).await;
+    let mut settings = Settings::default();
+    settings.broker.stream_passthrough = false;
+    settings.upstream = HashMap::from([("test-runtime".to_string(), "http://127.0.0.1:8080".to_string())]);
+    let storage = AuditStorage::open_in_memory().unwrap();
+    let (broker_base_url, broker_server) = spawn_http_app(router::app(settings, storage)).await;
 
     let client: Client<HttpConnector, Body> = Client::builder(TokioExecutor::new()).build_http();
     let response = client
@@ -300,9 +314,10 @@ async fn https_connector_large_request_body_handling() {
     );
     let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
 
-    let config = Config::default();
+    let settings = broker_settings(upstream_base_url);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     // Create a large request body
     let large_content = "x".repeat(10000);
@@ -362,9 +377,10 @@ async fn https_connector_query_param_forwarding() {
     );
     let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
 
-    let config = Config::default();
+    let settings = broker_settings(upstream_base_url);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request(
         &broker_base_url,
@@ -412,9 +428,10 @@ async fn https_connector_custom_headers_forwarding() {
     );
     let (upstream_base_url, upstream_server) = spawn_http_app(upstream).await;
 
-    let config = Config::default();
+    let settings = broker_settings(upstream_base_url);
+    let storage = AuditStorage::open_in_memory().unwrap();
     let (broker_base_url, broker_server) =
-        spawn_http_app(router::proxy_app(config, upstream_base_url)).await;
+        spawn_http_app(router::app(settings, storage)).await;
 
     let response = send_json_request_with_headers(
         &broker_base_url,
@@ -423,6 +440,7 @@ async fn https_connector_custom_headers_forwarding() {
         vec![
             ("x-trace-id", "test-123-456"),
             ("x-creavor-session-id", "session-abc"),
+            ("x-creavor-runtime", "test-runtime"),
             ("authorization", "Bearer test-token"),
             ("content-type", "application/json"),
             ("other-header", "should-be-kept"),
