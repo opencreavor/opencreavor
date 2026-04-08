@@ -11,14 +11,16 @@ const SESSION_HEADER: &str = "x-creavor-session-id";
 impl AuditStorage {
     pub fn insert_event(
         &self,
+        session_id: Option<&str>,
         event_type: &str,
-        request_id: Option<&str>,
+        tool_name: Option<&str>,
         payload: Option<&str>,
+        source: Option<&str>,
     ) -> anyhow::Result<i64> {
         self.connection().execute(
-            "INSERT INTO events (event_type, request_id, payload)
-             VALUES (?1, ?2, ?3)",
-            params![event_type, request_id, payload],
+            "INSERT INTO events (session_id, event_type, tool_name, payload, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_id, event_type, tool_name, payload, source],
         )?;
 
         Ok(self.connection().last_insert_rowid())
@@ -27,26 +29,50 @@ impl AuditStorage {
     pub fn insert_request_start(
         &self,
         request_id: &str,
+        session_id: Option<&str>,
+        runtime: &str,
         provider: &str,
         method: &str,
         path: &str,
-        session_id: Option<&str>,
-        request_body: &str,
+        blocked: bool,
+        block_reason: Option<&str>,
+        rule_id: Option<&str>,
+        severity: Option<&str>,
     ) -> anyhow::Result<()> {
-        let transaction = self.connection().unchecked_transaction()?;
-
-        transaction.execute(
-            "INSERT INTO requests (request_id, provider, method, path, session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![request_id, provider, method, path, session_id],
+        self.connection().execute(
+            "INSERT INTO requests (request_id, session_id, runtime, provider, method, path,
+                                  blocked, block_reason, rule_id, severity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                request_id,
+                session_id,
+                runtime,
+                provider,
+                method,
+                path,
+                blocked,
+                block_reason,
+                rule_id,
+                severity,
+            ],
         )?;
-        transaction.execute(
-            "INSERT INTO request_payloads (request_id, body)
-             VALUES (?1, ?2)",
-            params![request_id, request_body],
-        )?;
 
-        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_request_payload(
+        &self,
+        request_id: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.connection()
+            .execute(
+                "INSERT INTO request_payloads (request_id, body)
+                 VALUES (?1, ?2)",
+                params![request_id, body],
+            )
+            .with_context(|| format!("failed to insert request payload for {request_id}"))?;
+
         Ok(())
     }
 
@@ -55,20 +81,22 @@ impl AuditStorage {
         request_id: &str,
         terminal_reason: TerminalReason,
         response_status: Option<u16>,
-        response_body: Option<&str>,
+        latency_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let transaction = self.connection().unchecked_transaction()?;
         let changed = transaction.execute(
             "UPDATE requests
              SET terminal_reason = ?2,
                  response_status = ?3,
+                 latency_ms = ?4,
                  completed_at = CURRENT_TIMESTAMP
              WHERE request_id = ?1
                AND completed_at IS NULL",
             params![
                 request_id,
                 terminal_reason.as_str(),
-                response_status.map(i64::from)
+                response_status.map(i64::from),
+                latency_ms,
             ],
         )?;
 
@@ -90,31 +118,41 @@ impl AuditStorage {
             }
         }
 
-        if let Some(body) = response_body {
-            transaction.execute(
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn insert_response_payload(
+        &self,
+        request_id: &str,
+        body: &str,
+    ) -> anyhow::Result<()> {
+        self.connection()
+            .execute(
                 "INSERT INTO response_payloads (request_id, body)
                  VALUES (?1, ?2)
                  ON CONFLICT(request_id) DO UPDATE SET body = excluded.body",
                 params![request_id, body],
-            )?;
-        }
+            )
+            .with_context(|| format!("failed to insert response payload for {request_id}"))?;
 
-        transaction.commit()?;
         Ok(())
     }
 
     pub fn insert_violation(
         &self,
         request_id: &str,
+        rule_id: &str,
         rule_name: &str,
+        severity: &str,
+        matched_content: &str,
         action: &str,
-        detail: &str,
     ) -> anyhow::Result<i64> {
         self.connection()
             .execute(
-                "INSERT INTO violations (request_id, rule_name, action, detail)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![request_id, rule_name, action, detail],
+                "INSERT INTO violations (request_id, rule_id, rule_name, severity, matched_content, action)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![request_id, rule_id, rule_name, severity, matched_content, action],
             )
             .with_context(|| format!("failed to insert violation for request {request_id}"))?;
 
@@ -248,21 +286,29 @@ mod tests {
         let storage = started_storage();
 
         let event_id = storage
-            .insert_event("request.received", Some("req-1"), Some("{\"ok\":true}"))
+            .insert_event(
+                Some("session-1"),
+                "request.received",
+                None,
+                Some("{\"ok\":true}"),
+                None,
+            )
             .unwrap();
 
         let persisted = storage
             .connection()
             .query_row(
-                "SELECT event_type, request_id, payload
+                "SELECT session_id, event_type, tool_name, payload, source
                  FROM events
                  WHERE id = ?1",
                 [event_id],
                 |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 },
             )
@@ -271,11 +317,53 @@ mod tests {
         assert_eq!(
             persisted,
             (
+                Some("session-1".to_string()),
                 "request.received".to_string(),
-                Some("req-1".to_string()),
+                None,
                 Some("{\"ok\":true}".to_string()),
+                None,
             )
         );
+    }
+
+    #[test]
+    fn insert_event_persists_all_optional_fields() {
+        let storage = started_storage();
+
+        let event_id = storage
+            .insert_event(
+                Some("session-2"),
+                "tool.invocation",
+                Some("bash"),
+                Some("{\"cmd\":\"ls\"}"),
+                Some("codex"),
+            )
+            .unwrap();
+
+        let persisted = storage
+            .connection()
+            .query_row(
+                "SELECT session_id, event_type, tool_name, payload, source
+                 FROM events
+                 WHERE id = ?1",
+                [event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(persisted.0, Some("session-2".to_string()));
+        assert_eq!(persisted.1, "tool.invocation");
+        assert_eq!(persisted.2, Some("bash".to_string()));
+        assert_eq!(persisted.3, Some("{\"cmd\":\"ls\"}".to_string()));
+        assert_eq!(persisted.4, Some("codex".to_string()));
     }
 
     #[test]
@@ -285,27 +373,32 @@ mod tests {
         storage
             .insert_request_start(
                 "req-1",
+                Some("session-1"),
+                "codex",
                 "openai",
                 "POST",
                 "/v1/openai/responses",
-                Some("session-1"),
-                "{\"input\":\"hello\"}",
+                false,
+                None,
+                None,
+                None,
             )
             .unwrap();
         storage
-            .finalize_request(
-                "req-1",
-                TerminalReason::Ok,
-                Some(200),
-                Some("{\"id\":\"resp-1\"}"),
-            )
+            .insert_request_payload("req-1", "{\"input\":\"hello\"}")
+            .unwrap();
+        storage
+            .finalize_request("req-1", TerminalReason::Ok, Some(200), Some(50))
+            .unwrap();
+        storage
+            .insert_response_payload("req-1", "{\"id\":\"resp-1\"}")
             .unwrap();
 
         let request = storage
             .connection()
             .query_row(
-                "SELECT provider, method, path, session_id, terminal_reason, response_status,
-                        started_at IS NOT NULL, completed_at IS NOT NULL
+                "SELECT runtime, provider, method, path, session_id, terminal_reason,
+                        response_status, latency_ms, started_at IS NOT NULL, completed_at IS NOT NULL
                  FROM requests
                  WHERE request_id = ?1",
                 ["req-1"],
@@ -314,11 +407,13 @@ mod tests {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(3)?,
                         row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -327,12 +422,14 @@ mod tests {
         assert_eq!(
             request,
             (
+                "codex".to_string(),
                 "openai".to_string(),
                 "POST".to_string(),
                 "/v1/openai/responses".to_string(),
                 Some("session-1".to_string()),
                 Some("ok".to_string()),
                 Some(200),
+                Some(50),
                 1,
                 1,
             )
@@ -366,11 +463,15 @@ mod tests {
         storage
             .insert_request_start(
                 "req-2",
+                None,
+                "codex",
                 "anthropic",
                 "POST",
                 "/v1/anthropic/messages",
+                false,
                 None,
-                "{\"messages\":[]}",
+                None,
+                None,
             )
             .unwrap();
         storage
@@ -380,7 +481,7 @@ mod tests {
         let persisted = storage
             .connection()
             .query_row(
-                "SELECT terminal_reason, response_status, completed_at IS NOT NULL
+                "SELECT terminal_reason, response_status, latency_ms, completed_at IS NOT NULL
                  FROM requests
                  WHERE request_id = ?1",
                 ["req-2"],
@@ -388,12 +489,16 @@ mod tests {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(persisted, (Some("client_cancelled".to_string()), None, 1));
+        assert_eq!(
+            persisted,
+            (Some("client_cancelled".to_string()), None, None, 1)
+        );
 
         let response_payload_count: i64 = storage
             .connection()
@@ -413,22 +518,33 @@ mod tests {
         storage
             .insert_request_start(
                 "req-3",
+                None,
+                "codex",
                 "openai",
                 "POST",
                 "/v1/openai/responses",
+                false,
                 None,
-                "{\"input\":\"sk-123\"}",
+                None,
+                None,
             )
             .unwrap();
 
         let violation_id = storage
-            .insert_violation("req-3", "secrets", "block", "api key matched")
+            .insert_violation(
+                "req-3",
+                "rule-secrets",
+                "secrets",
+                "high",
+                "sk-12345",
+                "block",
+            )
             .unwrap();
 
         let persisted = storage
             .connection()
             .query_row(
-                "SELECT request_id, rule_name, action, detail
+                "SELECT request_id, rule_id, rule_name, severity, matched_content, action
                  FROM violations
                  WHERE id = ?1",
                 [violation_id],
@@ -438,6 +554,8 @@ mod tests {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
@@ -447,9 +565,11 @@ mod tests {
             persisted,
             (
                 "req-3".to_string(),
+                "rule-secrets".to_string(),
                 "secrets".to_string(),
+                "high".to_string(),
+                "sk-12345".to_string(),
                 "block".to_string(),
-                "api key matched".to_string(),
             )
         );
     }
@@ -461,34 +581,33 @@ mod tests {
         storage
             .insert_request_start(
                 "req-4",
+                None,
+                "codex",
                 "openai",
                 "POST",
                 "/v1/openai/responses",
+                false,
                 None,
-                "{\"input\":\"first\"}",
+                None,
+                None,
             )
             .unwrap();
         storage
-            .finalize_request(
-                "req-4",
-                TerminalReason::Ok,
-                Some(200),
-                Some("{\"id\":\"first\"}"),
-            )
+            .finalize_request("req-4", TerminalReason::Ok, Some(200), Some(10))
             .unwrap();
 
         let second = storage.finalize_request(
             "req-4",
             TerminalReason::ClientCancelled,
             Some(499),
-            Some("{\"id\":\"second\"}"),
+            Some(20),
         );
         assert!(second.is_err());
 
         let request = storage
             .connection()
             .query_row(
-                "SELECT terminal_reason, response_status
+                "SELECT terminal_reason, response_status, latency_ms
                  FROM requests
                  WHERE request_id = ?1",
                 ["req-4"],
@@ -496,21 +615,15 @@ mod tests {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
                         row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
                     ))
                 },
             )
             .unwrap();
-        assert_eq!(request, (Some("ok".to_string()), Some(200)));
-
-        let response_body: String = storage
-            .connection()
-            .query_row(
-                "SELECT body FROM response_payloads WHERE request_id = ?1",
-                ["req-4"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(response_body, "{\"id\":\"first\"}");
+        assert_eq!(
+            request,
+            (Some("ok".to_string()), Some(200), Some(10))
+        );
     }
 
     #[test]
