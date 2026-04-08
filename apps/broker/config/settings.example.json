@@ -1,0 +1,23 @@
+{
+  "broker": {
+    "port": 8765,
+    "log_level": "info",
+    "block_status_code": 400,
+    "block_error_style": "auto",
+    "stream_passthrough": true,
+    "upstream_timeout_secs": 300,
+    "idle_stream_timeout_secs": 120
+  },
+  "upstream": {
+    "claude": "https://api.anthropic.com",
+    "gemini": "https://generativelanguage.googleapis.com"
+  },
+  "audit": {
+    "event_auth_token": "env:CREAVOR_BROKER_EVENT_TOKEN",
+    "store_request_payloads": false,
+    "store_response_payloads": false
+  },
+  "rules": {
+    "llm_analyzer_enabled": false
+  }
+}

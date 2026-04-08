@@ -18,7 +18,7 @@
 # opencreavor
 
 ### Your AI-native R&D organization in a box.
-**Spec-driven. Multi-agent. Privacy-first.**  
+**Spec-driven. Multi-agent. Privacy-first.**
 From idea to deployable product — with full control.
 
 ---
@@ -37,12 +37,12 @@ Unlike traditional AI coding assistants, opencreavor models a **structured engin
 
 Modern AI tools generate code. They do not manage engineering systems. opencreavor provides:
 
-- **Structured specifications as the single source of truth**  
-- **Multi-agent role orchestration**: Product, Architect, Backend, Frontend, QA, DevOps  
-- **Version-aware technical knowledge alignment**  
-- **Private, self-hosted knowledge system**  
-- **Policy- and compliance-aware generation**  
-- **Plugin-driven extensibility**: agents, connectors, models, deployment targets  
+- **Structured specifications as the single source of truth**
+- **Multi-agent role orchestration**: Product, Architect, Backend, Frontend, QA, DevOps
+- **Version-aware technical knowledge alignment**
+- **Private, self-hosted knowledge system**
+- **Policy- and compliance-aware generation**
+- **Plugin-driven extensibility**: agents, connectors, models, deployment targets
 
 It bridges the gap between large language models and **real-world software delivery**.
 
@@ -52,11 +52,11 @@ It bridges the gap between large language models and **real-world software deliv
 
 opencreavor is designed for teams that require:
 
-- Local-first or fully self-hosted deployment  
-- Protection of confidential knowledge and known internal risks  
-- Enforcement of compliance policies (e.g., GDPR, internal IT rules)  
-- Long-term system evolution rather than one-off generation  
-- Auditability and traceable decision-making  
+- Local-first or fully self-hosted deployment
+- Protection of confidential knowledge and known internal risks
+- Enforcement of compliance policies (e.g., GDPR, internal IT rules)
+- Long-term system evolution rather than one-off generation
+- Auditability and traceable decision-making
 
 All specifications, architectural decisions, compliance rules, and internal knowledge remain **fully under your control**.
 
@@ -66,54 +66,122 @@ All specifications, architectural decisions, compliance rules, and internal know
 
 opencreavor works immediately after installation:
 
-- Predefined multi-agent workflow  
-- Built-in spec templates  
-- Integrated private knowledge layer  
-- Default project scaffolding  
+- Predefined multi-agent workflow
+- Built-in spec templates
+- Integrated private knowledge layer
+- Default project scaffolding
 
 At the same time, everything is pluggable:
 
-- Agents  
-- Model providers  
-- Knowledge ingestion connectors  
-- Policy modules  
-- Deployment targets  
+- Agents
+- Model providers
+- Knowledge ingestion connectors
+- Policy modules
+- Deployment targets
 
 It is **ready to run**, and built to **evolve with your organization**.
 
 ---
 
-## Creavor Broker (P0)
+## Project Structure
 
-`creavor-broker` is a local interception proxy for AI coding runtimes.
-
-### Quick Start
-
-1. Create an event auth token:
-
-```bash
-export CREAVOR_BROKER_EVENT_TOKEN="$(openssl rand -hex 32)"
+```
+opencreavor/
+├── libs/creavor-core/     # Shared types: Settings, RuntimeType, utilities
+├── apps/broker/           # broker-server: local interception proxy
+└── apps/creavor-cli/      # creavor: CLI tool to launch runtimes through broker
 ```
 
-2. Start broker with example config:
+All three crates share configuration via `~/.opencreavor/settings.json`.
+
+---
+
+## Quick Start
+
+### 1. Start the broker
 
 ```bash
-cargo run -p creavor-broker -- --config apps/broker/config/config.example.toml
+# Option A: with example config
+cargo run -p creavor-broker -- --config apps/broker/config/settings.example.json
+
+# Option B: using defaults (reads ~/.opencreavor/settings.json)
+cargo run -p creavor-broker
 ```
 
-3. Point runtime API base URL to broker:
+### 2. Launch a runtime through the broker
 
-- Claude Code: `http://127.0.0.1:8765/v1/anthropic`
-- OpenCode/OpenClaw: `http://127.0.0.1:8765/v1/openai`
+```bash
+# Build and install the CLI
+cargo install --path apps/creavor-cli
 
-### Key Runtime Controls
+# Run a runtime (auto-registers upstream, launches with proxy)
+creavor run claude
+creavor run gemini
+creavor run codex
+```
 
-- `block_status_code` defaults to `400`
-- `block_error_style` defaults to `auto`
-- `stream_passthrough` defaults to `true`
-- `upstream_timeout` and `idle_stream_timeout` control streaming behavior
+### 3. (Optional) Permanently configure a runtime
 
-### Runtime Setup Docs
+```bash
+creavor config claude    # Writes proxy URL into Claude's settings
+creavor config gemini    # Prints GEMINI_API_BASE export instruction
+```
+
+### 4. (Optional) Check broker status
+
+```bash
+creavor status
+```
+
+---
+
+## Supported Runtimes
+
+| Runtime | Provider Route | Config Method |
+|---------|---------------|---------------|
+| Claude Code | `/v1/anthropic` | `~/.claude/settings.json` (`apiBaseUrl`) |
+| Gemini CLI | `/v1/gemini` | `GEMINI_API_BASE` env var |
+| OpenCode | `/v1/openai` | `OPENAI_BASE_URL` env var |
+| OpenClaw | `/v1/openai` | `OPENAI_BASE_URL` env var |
+| Codex | `/v1/openai` | `OPENAI_BASE_URL` env var |
+| Cline | `/v1/openai` | `OPENAI_BASE_URL` env var |
+
+---
+
+## Configuration
+
+All config lives in `~/.opencreavor/settings.json`:
+
+```json
+{
+  "broker": {
+    "port": 8765,
+    "log_level": "info",
+    "block_status_code": 400,
+    "block_error_style": "auto",
+    "stream_passthrough": true,
+    "upstream_timeout_secs": 300,
+    "idle_stream_timeout_secs": 120
+  },
+  "upstream": {
+    "claude": "https://api.anthropic.com"
+  },
+  "audit": {
+    "event_auth_token": "env:CREAVOR_BROKER_EVENT_TOKEN",
+    "store_request_payloads": false,
+    "store_response_payloads": false
+  },
+  "rules": {
+    "llm_analyzer_enabled": false
+  }
+}
+```
+
+See `apps/broker/config/settings.example.json` for a full example.
+
+---
+
+## Runtime Setup Docs
 
 - `runtimes/claude-code/README.md`
 - `runtimes/opencode/README.md`

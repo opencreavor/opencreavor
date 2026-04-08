@@ -1,9 +1,9 @@
 use std::process::Command;
 
-use crate::{broker, session, settings::{CreavorSettings, RuntimeType, is_broker_address}};
+use crate::{broker, session, settings::{RuntimeType, Settings, is_broker_address}};
 
 pub fn run() -> anyhow::Result<()> {
-    let mut settings = CreavorSettings::load();
+    let mut settings = Settings::load_or_default();
     let original_url = RuntimeType::OpenCode.read_current_api_url();
 
     if let Some(ref url) = original_url {
@@ -36,7 +36,7 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 pub fn config() -> anyhow::Result<()> {
-    let mut settings = CreavorSettings::load();
+    let mut settings = Settings::load_or_default();
     let proxy_url = settings.broker_proxy_url("openai");
     let original_url = RuntimeType::OpenCode.read_current_api_url();
 

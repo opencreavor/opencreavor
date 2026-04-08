@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+creavor-core = { path = "../../libs/creavor-core" }
 axum = "0.8"
 futures-core = "0.3"
 futures-util = "0.3"

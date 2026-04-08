@@ -175,6 +175,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "creavor-core",
  "futures-core",
  "futures-util",
  "http-body-util",
@@ -198,6 +199,7 @@ name = "creavor-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "creavor-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -206,6 +208,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "creavor-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
