@@ -1,4 +1,7 @@
 mod claude;
+mod cline;
+mod codex;
+mod gemini;
 mod openclaw;
 mod opencode;
 
@@ -9,7 +12,9 @@ pub fn run(runtime: RuntimeType) -> anyhow::Result<()> {
         RuntimeType::Claude => claude::run(),
         RuntimeType::OpenCode => opencode::run(),
         RuntimeType::OpenClaw => openclaw::run(),
-        other => anyhow::bail!("runtime '{}' is not yet implemented", other.name()),
+        RuntimeType::Codex => codex::run(),
+        RuntimeType::Cline => cline::run(),
+        RuntimeType::Gemini => gemini::run(),
     }
 }
 
@@ -18,6 +23,8 @@ pub fn config(runtime: RuntimeType) -> anyhow::Result<()> {
         RuntimeType::Claude => claude::config(),
         RuntimeType::OpenCode => opencode::config(),
         RuntimeType::OpenClaw => openclaw::config(),
-        other => anyhow::bail!("runtime '{}' config is not yet implemented", other.name()),
+        RuntimeType::Codex => codex::config(),
+        RuntimeType::Cline => cline::config(),
+        RuntimeType::Gemini => gemini::config(),
     }
 }
