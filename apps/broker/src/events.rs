@@ -25,10 +25,10 @@ pub struct EventsState {
 }
 
 impl EventsState {
-    pub fn new(expected_token: Option<String>, storage: AuditStorage) -> Self {
+    pub fn new(expected_token: Option<String>, storage: Arc<Mutex<AuditStorage>>) -> Self {
         Self {
             expected_token: normalize_expected_token(expected_token),
-            storage: Arc::new(Mutex::new(storage)),
+            storage,
             rate_limiter: Arc::new(Mutex::new(LocalRateLimiter::new(
                 RATE_LIMIT_WINDOW,
                 RATE_LIMIT_MAX_EVENTS,
@@ -63,9 +63,11 @@ impl EventsState {
     fn persist_event(&self, payload: &Value, correlation_id: &str) -> anyhow::Result<()> {
         let serialized = serde_json::to_string(payload)?;
         self.storage.lock().unwrap().insert_event(
-            event_type_from_payload(payload),
-            Some(correlation_id),
-            Some(&serialized),
+            Some(correlation_id),               // session_id
+            event_type_from_payload(payload),   // event_type
+            None,                               // tool_name — not available from event payload
+            Some(&serialized),                  // payload
+            None,                               // source
         )?;
         Ok(())
     }
