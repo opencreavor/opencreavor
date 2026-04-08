@@ -20,16 +20,21 @@ Options:
 -v, --version VERSION  Install a specific version (e.g., 0.1.0)
 -b, --binary PATH      Install from local binaries instead of downloading
 --no-modify-path       Don't modify shell config files (.zshrc, .bashrc, etc.)
+--no-service           Don't install broker-server as a system service
+--uninstall            Uninstall opencreavor and remove the service
 
 Examples:
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install | bash
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install | bash -s -- --version 0.1.0
   ./install --binary /path/to/creavor
+  ./install --uninstall
 EOF
 }
 
 requested_version=${VERSION:-}
 no_modify_path=false
+no_service=false
+uninstall=false
 binary_dir=""
 
 while [[ $# -gt 0 ]]; do
@@ -60,12 +65,53 @@ case "$1" in
   no_modify_path=true
   shift
   ;;
+--no-service)
+  no_service=true
+  shift
+  ;;
+--uninstall)
+  uninstall=true
+  shift
+  ;;
 *)
   echo -e "${ORANGE}Warning: Unknown option '$1'${NC}" >&2
   shift
   ;;
 esac
 done
+
+# ---------------------------------------------------------------------------
+# Uninstall
+# ---------------------------------------------------------------------------
+
+uninstall_opencreavor() {
+  print_message info "\n${MUTED}Uninstalling opencreavor...${NC}"
+
+  # Stop and remove service
+  remove_service
+
+  # Remove binaries
+  if [[ -d "$INSTALL_DIR" ]]; then
+    rm -f "${INSTALL_DIR}/creavor" "${INSTALL_DIR}/broker-server"
+    if [[ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
+      rmdir "$INSTALL_DIR"
+      print_message success "Removed ${INSTALL_DIR}"
+    else
+      print_message info "${MUTED}Kept ${INSTALL_DIR} (not empty)${NC}"
+    fi
+  fi
+
+  # Remove config (ask user first? just leave it)
+  print_message info "${MUTED}Config preserved at ~/.opencreavor/${NC}"
+
+  print_message success "\nUninstalled opencreavor."
+  print_message info "${MUTED}Remove PATH entries from your shell config manually if needed.${NC}"
+  exit 0
+}
+
+if [[ "$uninstall" == "true" ]]; then
+  uninstall_opencreavor
+fi
 
 print_message() {
   local level=$1
@@ -246,6 +292,168 @@ install_from_binary() {
 }
 
 # ---------------------------------------------------------------------------
+# Service management
+# ---------------------------------------------------------------------------
+
+detect_os() {
+  local raw_os=$(uname -s)
+  case "$raw_os" in
+  Darwin*) echo "darwin" ;;
+  Linux*) echo "linux" ;;
+  *) echo "unknown" ;;
+  esac
+}
+
+install_service() {
+  if [[ "$no_service" == "true" ]]; then return; fi
+  if [[ ! -f "${INSTALL_DIR}/broker-server" ]]; then
+    print_message warning "broker-server not found, skipping service installation"
+    return
+  fi
+
+  local os=$(detect_os)
+  case "$os" in
+  darwin) install_launchd_service ;;
+  linux)  install_systemd_service ;;
+  *)      print_message warning "Service auto-start not supported on $os" ;;
+  esac
+}
+
+remove_service() {
+  local os=$(detect_os)
+  case "$os" in
+  darwin) remove_launchd_service ;;
+  linux)  remove_systemd_service ;;
+  esac
+}
+
+# --- macOS launchd ---
+
+install_launchd_service() {
+  local plist_name="com.opencreavor.broker"
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist_path="${plist_dir}/${plist_name}.plist"
+  local log_dir="$HOME/.opencreavor/logs"
+  local log_path="${log_dir}/broker-server.log"
+
+  mkdir -p "$plist_dir" "$log_dir"
+
+  # Stop existing service if running
+  if launchctl list "$plist_name" >/dev/null 2>&1; then
+    print_message info "${MUTED}Stopping existing broker service...${NC}"
+    launchctl bootout "gui/$(id -u)/${plist_name}" 2>/dev/null || true
+  fi
+
+  cat > "$plist_path" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${plist_name}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/broker-server</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${log_path}</string>
+    <key>StandardErrorPath</key>
+    <string>${log_path}</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
+PLIST
+
+  launchctl bootstrap "gui/$(id -u)" "$plist_path" 2>/dev/null
+
+  print_message success "broker-server installed as launchd service (auto-start on login)"
+  print_message info "${MUTED}  Log: ${log_path}${NC}"
+  print_message info "${MUTED}  Manage: launchctl kickstart -k gui/$(id -u)/${plist_name}${NC}"
+}
+
+remove_launchd_service() {
+  local plist_name="com.opencreavor.broker"
+  local plist_path="$HOME/Library/LaunchAgents/${plist_name}.plist"
+
+  if launchctl list "$plist_name" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/${plist_name}" 2>/dev/null || true
+    print_message info "${MUTED}Stopped broker service${NC}"
+  fi
+  if [[ -f "$plist_path" ]]; then
+    rm "$plist_path"
+    print_message info "${MUTED}Removed ${plist_path}${NC}"
+  fi
+}
+
+# --- Linux systemd ---
+
+install_systemd_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    print_message warning "systemctl not found, skipping service installation"
+    return
+  fi
+
+  local service_dir="$HOME/.config/systemd/user"
+  local service_path="${service_dir}/creavor-broker.service"
+  local log_dir="$HOME/.opencreavor/logs"
+
+  mkdir -p "$service_dir" "$log_dir"
+
+  cat > "$service_path" <<SERVICE
+[Unit]
+Description=OpenCreavor Broker Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${INSTALL_DIR}/broker-server
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+StandardOutput=append:${log_dir}/broker-server.log
+StandardError=append:${log_dir}/broker-server.log
+
+[Install]
+WantedBy=default.target
+SERVICE
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now creavor-broker.service 2>/dev/null
+
+  print_message success "broker-server installed as systemd user service (auto-start on login)"
+  print_message info "${MUTED}  Log: ${log_dir}/broker-server.log${NC}"
+  print_message info "${MUTED}  Manage: systemctl --user start/stop/restart creavor-broker${NC}"
+  print_message info "${MUTED}  Status: systemctl --user status creavor-broker${NC}"
+}
+
+remove_systemd_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then return; fi
+
+  if systemctl --user is-active creavor-broker >/dev/null 2>&1; then
+    systemctl --user stop creavor-broker 2>/dev/null || true
+    print_message info "${MUTED}Stopped broker service${NC}"
+  fi
+  if systemctl --user is-enabled creavor-broker >/dev/null 2>&1; then
+    systemctl --user disable creavor-broker 2>/dev/null || true
+  fi
+
+  local service_path="$HOME/.config/systemd/user/creavor-broker.service"
+  if [[ -f "$service_path" ]]; then
+    rm "$service_path"
+    systemctl --user daemon-reload 2>/dev/null || true
+    print_message info "${MUTED}Removed ${service_path}${NC}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # PATH configuration
 # ---------------------------------------------------------------------------
 
@@ -315,6 +523,7 @@ else
   download_and_install
 fi
 
+install_service
 configure_path
 
 # GitHub Actions support
@@ -334,8 +543,17 @@ echo -e "  ${GREEN}creavor${NC}        ${MUTED}CLI tool to launch AI runtimes th
 echo -e "  ${GREEN}broker-server${NC}  ${MUTED}Local interception proxy for AI coding runtimes${NC}"
 echo ""
 echo -e "${MUTED}Quick start:${NC}"
-echo -e "  ${MUTED}1.${NC} broker-server ${MUTED}# Start the broker${NC}"
-echo -e "  ${MUTED}2.${NC} creavor run claude ${MUTED}# Launch Claude Code through the broker${NC}"
+echo -e "  ${MUTED}1.${NC} creavor run claude ${MUTED}# Launch Claude Code (broker auto-started as service)${NC}"
+echo -e "  ${MUTED}2.${NC} creavor status ${MUTED}# Check broker health${NC}"
+echo -e ""
+echo -e "${MUTED}Service management:${NC}"
+if [[ "$(detect_os)" == "darwin" ]]; then
+echo -e "  ${MUTED}launchctl kickstart -k gui/\$(id -u)/com.opencreavor.broker${NC}  # restart"
+echo -e "  ${MUTED}launchctl bootout gui/\$(id -u)/com.opencreavor.broker${NC}       # stop"
+else
+echo -e "  ${MUTED}systemctl --user restart creavor-broker${NC}  # restart"
+echo -e "  ${MUTED}systemctl --user stop creavor-broker${NC}     # stop"
+fi
 echo ""
 echo -e "${MUTED}Supported runtimes: claude, gemini, codex, opencode, openclaw, cline${NC}"
 echo -e "${MUTED}Docs: https://github.com/${REPO}${NC}"
