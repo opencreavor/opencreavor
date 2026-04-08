@@ -41,6 +41,15 @@ fn launch_with_proxy() -> anyhow::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
+pub fn config() -> anyhow::Result<()> {
+    let runtime = crate::settings::RuntimeType::OpenCode;
+    let creavor_settings = crate::settings::CreavorSettings::load();
+    let broker_proxy_url = creavor_settings.broker_proxy_url(runtime.provider_route());
+    runtime.write_api_url(&broker_proxy_url)?;
+    tracing::info!("configured {BINARY_NAME} to use creavor broker at {broker_proxy_url}");
+    Ok(())
+}
+
 fn find_binary(name: &str) -> anyhow::Result<String> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {

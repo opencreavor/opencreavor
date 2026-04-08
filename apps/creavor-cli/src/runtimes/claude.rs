@@ -4,7 +4,6 @@ use crate::{broker, session, settings};
 
 const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const CUSTOM_HEADERS_ENV: &str = "ANTHROPIC_CUSTOM_HEADERS";
-const BROKER_PROXY_URL: &str = "http://127.0.0.1:8765/v1/anthropic";
 const BINARY_NAME: &str = "claude";
 const RUNTIME_NAME: &str = "claude";
 
@@ -30,13 +29,18 @@ fn launch_direct() -> anyhow::Result<()> {
 
 fn launch_with_proxy() -> anyhow::Result<()> {
     let binary = find_binary(BINARY_NAME)?;
-    let original_url =
-        settings::resolve_original_base_url(settings::Runtime::Claude);
+    let runtime = settings::RuntimeType::Claude;
+    let creavor_settings = settings::CreavorSettings::load();
+
+    let original_url = runtime
+        .read_current_api_url()
+        .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+    let broker_proxy_url = creavor_settings.broker_proxy_url(runtime.provider_route());
     let session_id = session::generate_session_id(RUNTIME_NAME);
 
     tracing::info!(
         original_url = %original_url,
-        proxy_url = %BROKER_PROXY_URL,
+        proxy_url = %broker_proxy_url,
         session_id = %session_id,
         "launching {BINARY_NAME} with creavor proxy"
     );
@@ -44,13 +48,22 @@ fn launch_with_proxy() -> anyhow::Result<()> {
     let custom_header = format!("X-Creavor-Session-Id:{session_id}");
 
     let status = Command::new(&binary)
-        .env(BASE_URL_ENV, BROKER_PROXY_URL)
+        .env(BASE_URL_ENV, &broker_proxy_url)
         .env(CUSTOM_HEADERS_ENV, &custom_header)
         .env("CREAVOR_SESSION_ID", &session_id)
         .status()
         .map_err(|e| anyhow::anyhow!("failed to launch {BINARY_NAME}: {e}"))?;
 
     std::process::exit(status.code().unwrap_or(1));
+}
+
+pub fn config() -> anyhow::Result<()> {
+    let runtime = settings::RuntimeType::Claude;
+    let creavor_settings = settings::CreavorSettings::load();
+    let broker_proxy_url = creavor_settings.broker_proxy_url(runtime.provider_route());
+    runtime.write_api_url(&broker_proxy_url)?;
+    tracing::info!("configured {BINARY_NAME} to use creavor broker at {broker_proxy_url}");
+    Ok(())
 }
 
 fn find_binary(name: &str) -> anyhow::Result<String> {

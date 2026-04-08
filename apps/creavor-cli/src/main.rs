@@ -17,6 +17,7 @@ fn main() -> anyhow::Result<()> {
 
     match command {
         cli::Command::Run { runtime } => runtimes::run(runtime),
+        cli::Command::Config { runtime } => runtimes::config(runtime),
         cli::Command::Status => broker::status(),
     }
 }
