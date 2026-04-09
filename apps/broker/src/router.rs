@@ -170,7 +170,12 @@ async fn proxy_request(State(state): State<AppState>, request: Request) -> Respo
         Some(ref r) => r.entry.upstream.clone(),
         None => {
             // Legacy fallback: use runtime→URL mapping
-            match state.settings.get_upstream(&runtime) {
+            // Try runtime name first (e.g. "claude-code"), then provider name
+            // (e.g. "anthropic"), then any first configured upstream as default.
+            match state.settings.get_upstream(&runtime)
+                .or_else(|| state.settings.get_upstream(provider_name(provider)))
+                .or_else(|| state.settings.first_upstream())
+            {
                 Some(url) => url.to_string(),
                 None => {
                     tracing::error!(runtime = %runtime, "no upstream configured for runtime");
@@ -1046,8 +1051,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_with_email_gets_blocked_with_openai_error_format() {
-        let path = unique_temp_path("email-block");
+    async fn request_with_email_passes_after_rule_removal() {
+        let path = unique_temp_path("email-pass");
         let storage = AuditStorage::open(&path).unwrap();
         let (base_url, server) = spawn_app(test_settings_with_upstream(), storage).await;
 
@@ -1060,23 +1065,19 @@ mod tests {
         let response =
             send_proxy_request(&base_url, "/v1/openai/chat/completions", &body, "codex", None).await;
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Email rule was removed — should NOT be blocked (502 = upstream unreachable, not 400 block)
+        assert_ne!(response.status(), StatusCode::BAD_REQUEST, "email should not be blocked after rule removal");
 
-        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: Value = serde_json::from_slice(&resp_body).unwrap();
-        // OpenAI error format
-        assert!(json["error"]["message"].as_str().unwrap().contains("Blocked by Creavor broker"));
-        assert_eq!(json["error"]["code"], "content_policy_violation");
-
+        // Verify no violation was recorded
         let storage = AuditStorage::open(&path).unwrap();
-        let violation = storage.connection()
+        let count: i64 = storage.connection()
             .query_row(
-                "SELECT action FROM violations WHERE rule_id = 'email-address-001'",
+                "SELECT COUNT(*) FROM violations",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(violation, "blocked");
+        assert_eq!(count, 0, "no violations should be recorded for email");
 
         server.abort();
         let _ = fs::remove_file(path);

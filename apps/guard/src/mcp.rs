@@ -1,4 +1,4 @@
-use crate::approval::{ApprovalAction, ApprovalRequest, ApprovalStatus, ApprovalStore};
+use crate::approval::{ApprovalAction, ApprovalStore};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
@@ -267,6 +267,7 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::{ApprovalRequest, ApprovalStatus};
 
     #[test]
     fn handle_initialize_returns_capabilities() {

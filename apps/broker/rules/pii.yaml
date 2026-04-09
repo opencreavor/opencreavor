@@ -1,8 +1,4 @@
 rules:
-  - rule_id: email-address-001
-    rule_name: Email Address
-    severity: medium
-    pattern: '\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b'
   - rule_id: phone-number-001
     rule_name: Phone Number
     severity: medium

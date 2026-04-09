@@ -138,6 +138,11 @@ impl Settings {
         self.upstream.get(runtime).map(|s| s.as_str())
     }
 
+    /// Return the first configured upstream URL, useful as a default fallback.
+    pub fn first_upstream(&self) -> Option<&str> {
+        self.upstream.values().next().map(|s| s.as_str())
+    }
+
     /// Resolve `env:VAR_NAME` references to their values.
     pub fn resolve_env_ref(value: &str) -> anyhow::Result<String> {
         if let Some(name) = value.strip_prefix("env:") {

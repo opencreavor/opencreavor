@@ -158,15 +158,11 @@ mod tests {
     }
 
     #[test]
-    fn pii_regex_matches_email_and_sanitizes_middle() {
+    fn pii_email_rule_removed() {
         let rules = RuleSet::builtin();
-
-        let result = scan_request("contact: alice@example.com", &rules).unwrap();
-
-        assert_eq!(result.rule_id, "email-address-001");
-        assert_eq!(result.rule_name, "Email Address");
-        assert_eq!(result.severity, "medium");
-        assert_eq!(result.matched_content_sanitized, "ali***com");
+        // Email detection was removed from PII rules
+        let result = scan_request("contact: alice@example.com", &rules);
+        assert!(result.is_none(), "email rule should be removed");
     }
 
     #[test]

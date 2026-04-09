@@ -75,7 +75,7 @@ impl UpstreamRegistry {
     }
 
     /// Find an upstream entry whose base URL matches the given URL.
-    fn find_by_url(&self, url: &str) -> Option<(&str, &UpstreamEntry)> {
+    pub fn find_by_url(&self, url: &str) -> Option<(&str, &UpstreamEntry)> {
         let normalized = url.trim_end_matches('/');
         self.entries.iter().find(|(_, e)| {
             e.upstream.trim_end_matches('/') == normalized
