@@ -109,10 +109,6 @@ uninstall_opencreavor() {
   exit 0
 }
 
-if [[ "$uninstall" == "true" ]]; then
-  uninstall_opencreavor
-fi
-
 print_message() {
   local level=$1
   local message=$2
@@ -514,6 +510,10 @@ configure_path() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+if [[ "$uninstall" == "true" ]]; then
+  uninstall_opencreavor
+fi
 
 mkdir -p "$INSTALL_DIR"
 
