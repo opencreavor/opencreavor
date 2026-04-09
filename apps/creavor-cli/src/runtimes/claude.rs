@@ -27,6 +27,11 @@ pub fn run() -> anyhow::Result<()> {
     let proxy_url = settings.broker_proxy_url("anthropic");
     let custom_header = format!("X-Creavor-Session-Id:{session_id},X-Creavor-Runtime:claude");
 
+    // Rewrite Claude's settings.json to point ANTHROPIC_BASE_URL at the broker.
+    // Claude Code prioritizes env.ANTHROPIC_BASE_URL from its settings.json over
+    // the process environment variable, so we must modify the settings file.
+    RuntimeType::Claude.write_api_url(&proxy_url)?;
+
     tracing::info!(proxy_url = %proxy_url, session_id = %session_id, "launching claude with proxy");
 
     let status = Command::new(&binary)
@@ -34,6 +39,12 @@ pub fn run() -> anyhow::Result<()> {
         .env("ANTHROPIC_CUSTOM_HEADERS", &custom_header)
         .env("CREAVOR_SESSION_ID", &session_id)
         .status()?;
+
+    // Restore original URL after claude exits so other tools aren't affected.
+    if let Some(ref url) = original_url {
+        let _ = RuntimeType::Claude.write_api_url(url);
+    }
+
     std::process::exit(status.code().unwrap_or(1))
 }
 

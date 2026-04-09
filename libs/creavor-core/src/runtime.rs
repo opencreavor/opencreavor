@@ -87,9 +87,16 @@ impl RuntimeType {
                 }
                 let content = std::fs::read_to_string(&settings_path).ok()?;
                 let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-                json.get("apiBaseUrl")
+                // Claude Code stores the API URL in env.ANTHROPIC_BASE_URL
+                json.get("env")
+                    .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
+                    .or_else(|| {
+                        json.get("apiBaseUrl")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
             }
             Self::OpenCode | Self::OpenClaw | Self::Codex | Self::Cline | Self::Qwen => {
                 std::env::var("OPENAI_BASE_URL").ok()
@@ -112,7 +119,15 @@ impl RuntimeType {
                 } else {
                     serde_json::json!({})
                 };
-                settings["apiBaseUrl"] = serde_json::Value::String(url.to_string());
+                // Claude Code reads ANTHROPIC_BASE_URL from the env section of settings.json
+                // which takes priority over the ANTHROPIC_BASE_URL environment variable.
+                let env_obj = settings
+                    .as_object_mut()
+                    .expect("settings root must be an object");
+                let env_section = env_obj
+                    .entry("env")
+                    .or_insert_with(|| serde_json::json!({}));
+                env_section["ANTHROPIC_BASE_URL"] = serde_json::Value::String(url.to_string());
                 if let Some(parent) = settings_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
