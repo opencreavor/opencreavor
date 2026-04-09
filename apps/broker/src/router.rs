@@ -5,6 +5,7 @@ use crate::{
         anthropic_block_response_with_status, gemini_block_response_with_status,
         openai_block_response_with_status, strip_creavor_headers,
     },
+    path_rewrite::{normalize_join, parse_request_path},
     proxy::{forward_upstream, BoxError, ProxyTimeouts, TerminalReason, UpstreamResponse},
     rule_engine::{scan_request, RuleSet},
     storage::AuditStorage,
@@ -12,10 +13,11 @@ use crate::{
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{HeaderMap, HeaderName, Response, StatusCode, Uri},
+    http::{HeaderMap, HeaderName, Response, StatusCode},
     routing::{get, post},
     Router,
 };
+use creavor_core::{SessionRegistry, resolve_upstream};
 use futures_util::TryStreamExt;
 use http_body_util::BodyExt;
 use hyper_tls::HttpsConnector;
@@ -38,17 +40,13 @@ pub enum Provider {
     Gemini,
 }
 
-pub fn provider_for_path(path: &str) -> Option<Provider> {
-    if path.starts_with("/v1/anthropic") {
-        return Some(Provider::Anthropic);
+fn provider_from_protocol(protocol: &str) -> Option<Provider> {
+    match protocol {
+        "anthropic" => Some(Provider::Anthropic),
+        "openai" => Some(Provider::OpenAI),
+        "gemini" => Some(Provider::Gemini),
+        _ => None,
     }
-    if path.starts_with("/v1/openai") {
-        return Some(Provider::OpenAI);
-    }
-    if path.starts_with("/v1/gemini") {
-        return Some(Provider::Gemini);
-    }
-    None
 }
 
 fn provider_name(provider: Provider) -> &'static str {
@@ -65,6 +63,7 @@ struct AppState {
     rules: RuleSet,
     storage: Arc<Mutex<AuditStorage>>,
     client: Client<HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>, Body>,
+    session_registry: Arc<Mutex<SessionRegistry>>,
 }
 
 pub fn app(settings: Settings, storage: AuditStorage) -> Router {
@@ -74,11 +73,24 @@ pub fn app(settings: Settings, storage: AuditStorage) -> Router {
 
     let events_state =
         EventsState::new(settings.audit.event_auth_token.clone(), shared_storage.clone());
+    let rules = if let Some(ref rules_dir) = settings.rules.rules_dir {
+        let path = std::path::Path::new(rules_dir);
+        if path.is_dir() {
+            RuleSet::builtin_with_custom_dir(path)
+        } else {
+            tracing::warn!("rules_dir '{}' not found, using builtin rules only", rules_dir);
+            RuleSet::builtin()
+        }
+    } else {
+        RuleSet::builtin()
+    };
+
     let state = AppState {
         settings,
-        rules: RuleSet::builtin(),
+        rules,
         storage: shared_storage,
         client,
+        session_registry: Arc::new(Mutex::new(SessionRegistry::new())),
     };
 
     Router::new()
@@ -88,6 +100,7 @@ pub fn app(settings: Settings, storage: AuditStorage) -> Router {
             Router::new()
                 .route("/", get(health))
                 .route("/health", get(health))
+                // Legacy routes: /v1/{provider}/* (no upstream-id in path)
                 .route("/v1/openai", post(proxy_request))
                 .route("/v1/openai/{*path}", post(proxy_request))
                 .route("/v1/anthropic", post(proxy_request))
@@ -107,12 +120,20 @@ async fn health() -> Response<Body> {
 }
 
 async fn proxy_request(State(state): State<AppState>, request: Request) -> Response<Body> {
-    let provider = match provider_for_path(request.uri().path()) {
+    let request_path = request.uri().path().to_owned();
+
+    // 1. Parse path using new path_rewrite logic
+    let parsed = match parse_request_path(&request_path) {
         Some(p) => p,
         None => return terminal_response(StatusCode::NOT_FOUND),
     };
 
-    // 1. Read headers
+    let provider = match provider_from_protocol(&parsed.protocol) {
+        Some(p) => p,
+        None => return terminal_response(StatusCode::NOT_FOUND),
+    };
+
+    // 2. Read headers
     let runtime = request
         .headers()
         .get("x-creavor-runtime")
@@ -124,87 +145,201 @@ async fn proxy_request(State(state): State<AppState>, request: Request) -> Respo
         .get("x-creavor-session-id")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let header_upstream = request
+        .headers()
+        .get("x-creavor-upstream")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-    // 2. Resolve upstream from settings
-    let upstream_base = match state.settings.get_upstream(&runtime) {
-        Some(url) => url.to_string(),
+    // 3. Resolve upstream using the priority chain from design document
+    let resolved = {
+        let session_reg = state.session_registry.lock().unwrap();
+        resolve_upstream(
+            header_upstream.as_deref(),
+            session_id.as_deref(),
+            Some(&parsed.protocol),
+            Some(&runtime),
+            &state.settings.upstream_registry,
+            &session_reg,
+            &state.settings.upstream,
+        )
+    };
+
+    // Fallback to legacy upstream resolution if new registry doesn't resolve
+    let upstream_base = match resolved {
+        Some(ref r) => r.entry.upstream.clone(),
         None => {
-            tracing::error!(runtime = %runtime, "no upstream configured for runtime");
-            return terminal_response(StatusCode::BAD_GATEWAY);
+            // Legacy fallback: use runtime→URL mapping
+            match state.settings.get_upstream(&runtime) {
+                Some(url) => url.to_string(),
+                None => {
+                    tracing::error!(runtime = %runtime, "no upstream configured for runtime");
+                    return terminal_response(StatusCode::BAD_GATEWAY);
+                }
+            }
+        }
+    };
+
+    // 4. Determine the tail path for URL construction
+    let tail = match &parsed.upstream_id {
+        Some(_) => {
+            // Full path: tail already has the correct path after stripping upstream-id
+            parsed.tail.clone()
+        }
+        None => {
+            // Simplified path (legacy): strip the protocol prefix to get the API path
+            let prefix = format!("/v1/{}", parsed.protocol);
+            let path_and_query = request.uri()
+                .path_and_query()
+                .map(|v| v.as_str())
+                .unwrap_or(&request_path);
+            let suffix = path_and_query.strip_prefix(&prefix).unwrap_or(path_and_query);
+            if suffix.is_empty() { "/".to_string() } else { suffix.to_string() }
         }
     };
 
     let method = request.method().clone();
-    let request_path = request.uri().path().to_owned();
-    let upstream_uri = upstream_uri(&upstream_base, provider, request.uri());
+
+    // Build the upstream URI using normalize_join
+    let upstream_uri = normalize_join(&upstream_base, &tail);
 
     tracing::info!(
         method = %method,
         path = %request_path,
         upstream = %upstream_uri,
         runtime = %runtime,
+        upstream_id = ?parsed.upstream_id.or_else(|| resolved.as_ref().map(|r| r.upstream_id.clone())),
         "proxy request"
     );
 
-    // 3. Strip Creavor headers before forwarding
+    // 5. Strip Creavor headers before forwarding
     let mut headers = request.headers().clone();
     strip_creavor_headers(&mut headers);
     headers.remove(HOST);
     headers.remove(CONTENT_LENGTH);
 
-    // 4. Read request body
+    // 6. Read request body
     let request_body = request.into_body().collect().await.unwrap().to_bytes();
     let request_body_text = String::from_utf8(request_body.to_vec()).unwrap();
     let request_id = uuid::Uuid::new_v4().to_string();
     let start = Instant::now();
 
-    // 5. Rule scan
+    // 7. Rule scan with risk-level handling
     if let Some(rule_match) = scan_request(&request_body_text, &state.rules) {
-        tracing::warn!(
-            rule = %rule_match.rule_name,
-            runtime = %runtime,
-            "request blocked"
-        );
+        let severity = &rule_match.severity;
+        let risk_level = risk_level_from_severity(severity);
+
         let message = format!(
             "Blocked by Creavor broker: {} ({})",
             rule_match.rule_name, rule_match.matched_content_sanitized
         );
 
-        // Write audit for blocked request
-        if let Ok(storage) = state.storage.lock() {
-            let _ = storage.insert_request_start(
-                &request_id,
-                session_id.as_deref(),
-                &runtime,
-                provider_name(provider),
-                method.as_str(),
-                &request_path,
-                true,
-                Some(&message),
-                Some(&rule_match.rule_id),
-                Some(&rule_match.severity),
+        // Risk-level handling per design document:
+        // - Critical: direct block, no approval
+        // - High/Medium: block + create approval_request for Guard
+        // - Low: allow with logging (no block)
+        if risk_level == "low" {
+            // Low risk: allow but log
+            tracing::info!(
+                rule = %rule_match.rule_name,
+                runtime = %runtime,
+                severity = %severity,
+                "low-risk match, allowing with logging"
             );
-            let _ = storage.insert_violation(
-                &request_id,
-                &rule_match.rule_id,
-                &rule_match.rule_name,
-                &rule_match.severity,
-                &rule_match.matched_content_sanitized,
-                "blocked",
+            if let Ok(storage) = state.storage.lock() {
+                let _ = storage.insert_request_start(
+                    &request_id,
+                    session_id.as_deref(),
+                    &runtime,
+                    provider_name(provider),
+                    method.as_str(),
+                    &request_path,
+                    false,
+                    None,
+                    None,
+                    None,
+                );
+                let _ = storage.insert_violation(
+                    &request_id,
+                    &rule_match.rule_id,
+                    &rule_match.rule_name,
+                    &rule_match.severity,
+                    &rule_match.matched_content_sanitized,
+                    "logged",
+                );
+            }
+            // Fall through to forward the request
+        } else {
+            // Critical/High/Medium: block
+            tracing::warn!(
+                rule = %rule_match.rule_name,
+                runtime = %runtime,
+                severity = %severity,
+                risk_level = %risk_level,
+                "request blocked"
             );
-            let latency = start.elapsed().as_millis() as i64;
-            let _ = storage.finalize_request(
-                &request_id,
-                TerminalReason::Ok,
-                Some(state.settings.broker.block_status_code),
-                Some(latency),
-            );
-        }
 
-        return block_response(provider, &state.settings, &message);
+            let blocked = true;
+            if let Ok(storage) = state.storage.lock() {
+                let _ = storage.insert_request_start(
+                    &request_id,
+                    session_id.as_deref(),
+                    &runtime,
+                    provider_name(provider),
+                    method.as_str(),
+                    &request_path,
+                    blocked,
+                    Some(&message),
+                    Some(&rule_match.rule_id),
+                    Some(&rule_match.severity),
+                );
+                let _ = storage.insert_violation(
+                    &request_id,
+                    &rule_match.rule_id,
+                    &rule_match.rule_name,
+                    &rule_match.severity,
+                    &rule_match.matched_content_sanitized,
+                    "blocked",
+                );
+
+                // For High/Medium: create approval_request so Guard can review
+                if risk_level == "high" || risk_level == "medium" {
+                    let approval_id = uuid::Uuid::new_v4().to_string();
+                    let expires_secs = state.settings.guard.approval_timeout_secs;
+                    let expires_at = format_expires_at(expires_secs);
+                    let _ = storage.insert_approval_request(
+                        &approval_id,
+                        &request_id,
+                        session_id.as_deref(),
+                        &runtime,
+                        resolved.as_ref().map(|r| r.upstream_id.as_str()),
+                        &risk_level,
+                        &rule_match.rule_id,
+                        &rule_match.matched_content_sanitized,
+                        "pending",
+                        Some(&expires_at),
+                    );
+                    tracing::info!(
+                        approval_id = %approval_id,
+                        risk_level = %risk_level,
+                        "approval request created for Guard review"
+                    );
+                }
+
+                let latency = start.elapsed().as_millis() as i64;
+                let _ = storage.finalize_request(
+                    &request_id,
+                    TerminalReason::Ok,
+                    Some(state.settings.broker.block_status_code),
+                    Some(latency),
+                );
+            }
+
+            return block_response(provider, &state.settings, &message);
+        }
     }
 
-    // 6. Write audit for allowed request
+    // 8. Write audit for allowed request
     if let Ok(storage) = state.storage.lock() {
         let _ = storage.insert_request_start(
             &request_id,
@@ -223,7 +358,7 @@ async fn proxy_request(State(state): State<AppState>, request: Request) -> Respo
         }
     }
 
-    // 7. Forward upstream
+    // 9. Forward upstream
     let upstream_request =
         build_upstream_request(method.clone(), upstream_uri.clone(), headers, request_body_text.clone());
 
@@ -302,22 +437,6 @@ fn block_response(provider: Provider, settings: &Settings, message: &str) -> Res
     }
 }
 
-fn upstream_uri(base_url: &str, provider: Provider, uri: &Uri) -> String {
-    let prefix = match provider {
-        Provider::Anthropic => "/v1/anthropic",
-        Provider::OpenAI => "/v1/openai",
-        Provider::Gemini => "/v1/gemini",
-    };
-    let path_and_query = uri
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or(uri.path());
-    let suffix = path_and_query.strip_prefix(prefix).unwrap_or(path_and_query);
-    let suffix = if suffix.is_empty() { "/" } else { suffix };
-
-    format!("{}{}", base_url.trim_end_matches('/'), suffix)
-}
-
 fn build_upstream_request(
     method: axum::http::Method,
     uri: String,
@@ -374,6 +493,27 @@ fn terminal_response(status: StatusCode) -> Response<Body> {
 
 fn box_error(error: impl Into<BoxError>) -> BoxError {
     error.into()
+}
+
+/// Map severity string to risk level category.
+fn risk_level_from_severity(severity: &str) -> &'static str {
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => "critical",
+        "high" => "high",
+        "medium" => "medium",
+        "low" => "low",
+        _ => "low",
+    }
+}
+
+/// Generate an ISO-8601 expiry timestamp from now + timeout seconds.
+fn format_expires_at(timeout_secs: u64) -> String {
+    // Simple epoch-based expiry. In production, use a proper datetime library.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{}", now + timeout_secs)
 }
 
 #[cfg(test)]
@@ -477,33 +617,18 @@ mod tests {
             .unwrap()
     }
 
+    // -- Provider routing tests --
+
     #[test]
-    fn routes_anthropic_paths_to_anthropic() {
-        assert_eq!(
-            provider_for_path("/v1/anthropic/messages"),
-            Some(Provider::Anthropic)
-        );
+    fn provider_from_protocol_returns_correct_provider() {
+        assert_eq!(provider_from_protocol("anthropic"), Some(Provider::Anthropic));
+        assert_eq!(provider_from_protocol("openai"), Some(Provider::OpenAI));
+        assert_eq!(provider_from_protocol("gemini"), Some(Provider::Gemini));
     }
 
     #[test]
-    fn routes_openai_paths_to_openai() {
-        assert_eq!(
-            provider_for_path("/v1/openai/responses"),
-            Some(Provider::OpenAI)
-        );
-    }
-
-    #[test]
-    fn routes_gemini_paths_to_gemini() {
-        assert_eq!(
-            provider_for_path("/v1/gemini/generateContent"),
-            Some(Provider::Gemini)
-        );
-    }
-
-    #[test]
-    fn ignores_unknown_paths() {
-        assert_eq!(provider_for_path("/v1/other/messages"), None);
+    fn provider_from_protocol_ignores_unknown() {
+        assert_eq!(provider_from_protocol("unknown"), None);
     }
 
     #[test]
@@ -513,25 +638,7 @@ mod tests {
         assert_eq!(provider_name(Provider::Gemini), "gemini");
     }
 
-    #[test]
-    fn proxy_upstream_uri_strips_provider_prefix() {
-        let uri = Uri::from_static("/v1/openai/responses?stream=true");
-
-        assert_eq!(
-            upstream_uri("http://127.0.0.1:8080/", Provider::OpenAI, &uri),
-            "http://127.0.0.1:8080/responses?stream=true"
-        );
-    }
-
-    #[test]
-    fn proxy_upstream_uri_strips_gemini_prefix() {
-        let uri = Uri::from_static("/v1/gemini/models/gemini-pro:generateContent");
-
-        assert_eq!(
-            upstream_uri("https://generativelanguage.googleapis.com", Provider::Gemini, &uri),
-            "https://generativelanguage.googleapis.com/models/gemini-pro:generateContent"
-        );
-    }
+    // -- Events endpoint tests (preserved from original) --
 
     #[tokio::test]
     async fn events_missing_token_returns_unauthorized() {
@@ -792,11 +899,239 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: Value = serde_json::from_slice(&body).unwrap();
+        let json: Value = serde_json::from_slice::<Value>(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert_eq!(json["service"], "creavor-broker");
 
         server.abort();
         let _ = fs::remove_file(path);
+    }
+
+    fn test_settings_with_upstream() -> Settings {
+        let mut settings = test_settings();
+        settings
+            .upstream
+            .insert("claude-code".to_string(), "https://api.anthropic.com".to_string());
+        settings
+            .upstream
+            .insert("codex".to_string(), "https://api.openai.com".to_string());
+        settings
+    }
+
+    // -- Sensitive content blocking integration tests --
+
+    async fn send_proxy_request(
+        base_url: &str,
+        path: &str,
+        body: &str,
+        runtime: &str,
+        session_id: Option<&str>,
+    ) -> hyper::Response<hyper::body::Incoming> {
+        let client: Client<HttpConnector, Body> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri(format!("{base_url}{path}"))
+            .header("content-type", "application/json")
+            .header("x-creavor-runtime", runtime);
+
+        if let Some(sid) = session_id {
+            request = request.header("x-creavor-session-id", sid);
+        }
+
+        client
+            .request(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn request_with_profanity_gets_blocked_with_anthropic_error_format() {
+        let path = unique_temp_path("profanity-block");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_settings_with_upstream(), storage).await;
+
+        let body = serde_json::json!({
+            "model": "claude-3-opus-20240229",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "What the fuck is going on?"}]
+        })
+        .to_string();
+
+        let response =
+            send_proxy_request(&base_url, "/v1/anthropic/messages", &body, "claude-code", Some("session-test")).await;
+
+        // Should be blocked (default block_status_code is 400)
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&resp_body).unwrap();
+
+        // Anthropic error format
+        assert_eq!(json["type"], "error");
+        assert!(json["error"]["message"].as_str().unwrap().contains("Blocked by Creavor broker"));
+
+        // Verify DB records
+        let storage = AuditStorage::open(&path).unwrap();
+        let req = storage.connection()
+            .query_row(
+                "SELECT blocked, block_reason FROM requests WHERE runtime = 'claude-code'",
+                [],
+                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert!(req.0, "request should be marked as blocked");
+        assert!(req.1.unwrap().contains("Profanity"));
+
+        let violation = storage.connection()
+            .query_row(
+                "SELECT rule_id, severity, action FROM violations WHERE rule_id = 'profanity-en-001'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .unwrap();
+        assert_eq!(violation.0, "profanity-en-001");
+        assert_eq!(violation.1, "medium");
+        assert_eq!(violation.2, "blocked");
+
+        let approval = storage.connection()
+            .query_row(
+                "SELECT status, risk_level FROM approval_requests WHERE rule_id = 'profanity-en-001'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(approval.0, "pending");
+        assert_eq!(approval.1, "medium");
+
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn request_with_api_key_gets_blocked_and_creates_approval() {
+        let path = unique_temp_path("apikey-block");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_settings_with_upstream(), storage).await;
+
+        let body = serde_json::json!({
+            "model": "claude-3-opus-20240229",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "my key is sk-1234567890abcdef123456"}]
+        })
+        .to_string();
+
+        let response =
+            send_proxy_request(&base_url, "/v1/anthropic/messages", &body, "claude-code", Some("session-apikey")).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&resp_body).unwrap();
+        assert!(json["error"]["message"].as_str().unwrap().contains("OpenAI API Key"));
+
+        let storage = AuditStorage::open(&path).unwrap();
+        let approval = storage.connection()
+            .query_row(
+                "SELECT risk_level, status FROM approval_requests WHERE risk_level = 'high'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(approval.0, "high");
+        assert_eq!(approval.1, "pending");
+
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn request_with_email_gets_blocked_with_openai_error_format() {
+        let path = unique_temp_path("email-block");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_settings_with_upstream(), storage).await;
+
+        let body = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "Contact alice@example.com"}]
+        })
+        .to_string();
+
+        let response =
+            send_proxy_request(&base_url, "/v1/openai/chat/completions", &body, "codex", None).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&resp_body).unwrap();
+        // OpenAI error format
+        assert!(json["error"]["message"].as_str().unwrap().contains("Blocked by Creavor broker"));
+        assert_eq!(json["error"]["code"], "content_policy_violation");
+
+        let storage = AuditStorage::open(&path).unwrap();
+        let violation = storage.connection()
+            .query_row(
+                "SELECT action FROM violations WHERE rule_id = 'email-address-001'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(violation, "blocked");
+
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn clean_request_passes_without_blocking() {
+        let path = unique_temp_path("clean-pass");
+        let storage = AuditStorage::open(&path).unwrap();
+        let (base_url, server) = spawn_app(test_settings_with_upstream(), storage).await;
+
+        let body = serde_json::json!({
+            "model": "claude-3-opus-20240229",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hello, how are you today?"}]
+        })
+        .to_string();
+
+        let response =
+            send_proxy_request(&base_url, "/v1/anthropic/messages", &body, "claude-code", None).await;
+
+        let status = response.status();
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&resp_body);
+
+        // Should NOT be 400 (blocked). Will be 502 (upstream unreachable) or similar network error.
+        // Just verify it's not a block response.
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "clean request should not be blocked. Got status {status}, body: {body_str}"
+        );
+
+        // Verify no violation was recorded (DB may be empty or request not blocked)
+        let storage = AuditStorage::open(&path).unwrap();
+        let blocked_count: i64 = storage.connection()
+            .query_row(
+                "SELECT COUNT(*) FROM violations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_count, 0, "clean request should have no violations");
+
+        server.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn risk_level_mapping_is_correct() {
+        assert_eq!(risk_level_from_severity("critical"), "critical");
+        assert_eq!(risk_level_from_severity("high"), "high");
+        assert_eq!(risk_level_from_severity("medium"), "medium");
+        assert_eq!(risk_level_from_severity("low"), "low");
+        assert_eq!(risk_level_from_severity("unknown"), "low");
+        assert_eq!(risk_level_from_severity("High"), "high");
     }
 }

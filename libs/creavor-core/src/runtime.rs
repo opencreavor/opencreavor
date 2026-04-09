@@ -12,6 +12,7 @@ pub enum RuntimeType {
     Codex,
     Cline,
     Gemini,
+    Qwen,
 }
 
 impl RuntimeType {
@@ -24,11 +25,26 @@ impl RuntimeType {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Gemini => "gemini",
+            Self::Qwen => "qwen",
         }
     }
 
     /// Provider route: "anthropic" for Claude, "gemini" for Gemini, "openai"
     /// for the rest.
+    /// Stable runtime identifier used in X-Creavor-Runtime header.
+    /// Matches the design document's convention: "claude-code", "opencode", "codex", etc.
+    pub fn header_value(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude-code",
+            Self::OpenCode => "opencode",
+            Self::OpenClaw => "openclaw",
+            Self::Codex => "codex",
+            Self::Cline => "cline",
+            Self::Gemini => "gemini-cli",
+            Self::Qwen => "qwen-code",
+        }
+    }
+
     pub fn provider_route(&self) -> &'static str {
         match self {
             Self::Claude => "anthropic",
@@ -42,6 +58,7 @@ impl RuntimeType {
         match self {
             Self::Claude => "ANTHROPIC_BASE_URL",
             Self::Gemini => "GEMINI_API_BASE",
+            Self::Qwen => "OPENAI_BASE_URL",
             _ => "OPENAI_BASE_URL",
         }
     }
@@ -55,6 +72,7 @@ impl RuntimeType {
             Self::Codex => "codex",
             Self::Cline => "cline",
             Self::Gemini => "gemini",
+            Self::Qwen => "qwen",
         }
     }
 
@@ -73,7 +91,7 @@ impl RuntimeType {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             }
-            Self::OpenCode | Self::OpenClaw | Self::Codex | Self::Cline => {
+            Self::OpenCode | Self::OpenClaw | Self::Codex | Self::Cline | Self::Qwen => {
                 std::env::var("OPENAI_BASE_URL").ok()
             }
             Self::Gemini => {
@@ -139,6 +157,16 @@ mod tests {
         assert_eq!(RuntimeType::Gemini.provider_route(), "gemini");
         assert_eq!(RuntimeType::Codex.provider_route(), "openai");
         assert_eq!(RuntimeType::Cline.provider_route(), "openai");
+        assert_eq!(RuntimeType::Qwen.provider_route(), "openai");
+    }
+
+    #[test]
+    fn runtime_type_header_value() {
+        assert_eq!(RuntimeType::Claude.header_value(), "claude-code");
+        assert_eq!(RuntimeType::OpenCode.header_value(), "opencode");
+        assert_eq!(RuntimeType::Codex.header_value(), "codex");
+        assert_eq!(RuntimeType::Gemini.header_value(), "gemini-cli");
+        assert_eq!(RuntimeType::Qwen.header_value(), "qwen-code");
     }
 
     #[test]
@@ -146,6 +174,7 @@ mod tests {
         assert_eq!(RuntimeType::Claude.binary_name(), "claude");
         assert_eq!(RuntimeType::Gemini.binary_name(), "gemini");
         assert_eq!(RuntimeType::Codex.binary_name(), "codex");
+        assert_eq!(RuntimeType::Qwen.binary_name(), "qwen");
     }
 
     #[test]
@@ -153,6 +182,7 @@ mod tests {
         assert_eq!(RuntimeType::Claude.base_url_env_var(), "ANTHROPIC_BASE_URL");
         assert_eq!(RuntimeType::Gemini.base_url_env_var(), "GEMINI_API_BASE");
         assert_eq!(RuntimeType::Codex.base_url_env_var(), "OPENAI_BASE_URL");
+        assert_eq!(RuntimeType::Qwen.base_url_env_var(), "OPENAI_BASE_URL");
     }
 
     #[test]

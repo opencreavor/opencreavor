@@ -2,6 +2,7 @@ pub mod audit;
 pub mod config;
 pub mod events;
 pub mod interceptor;
+pub mod path_rewrite;
 pub mod proxy;
 pub mod router;
 pub mod rule_engine;
@@ -21,14 +22,17 @@ pub async fn run() -> anyhow::Result<()> {
         )
         .init();
 
-    let db_path = std::env::var("CREAVOR_BROKER_DB_PATH")
-        .unwrap_or_else(|_| "/tmp/creavor-broker.sqlite".to_string());
+    let db_path = settings.audit.db_path.clone().unwrap_or_else(|| {
+        std::env::var("CREAVOR_BROKER_DB_PATH")
+            .unwrap_or_else(|_| "/tmp/creavor-broker.sqlite".to_string())
+    });
 
     let port = settings.broker.port;
 
     tracing::info!(
         port = port,
         upstream_count = settings.upstream.len(),
+        registry_count = settings.upstream_registry.len(),
         "starting broker-server"
     );
 

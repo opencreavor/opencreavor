@@ -1,1 +1,5 @@
-rules: []
+rules:
+  - rule_id: profanity-en-001
+    rule_name: Profanity (English)
+    severity: medium
+    pattern: '(?i)\bfuck\w*|\bshit\w*|\bdamn\w*|\basshole\w*|\bbitch\w*'

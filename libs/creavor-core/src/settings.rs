@@ -1,3 +1,4 @@
+use crate::upstream::UpstreamRegistry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -10,9 +11,13 @@ use std::path::PathBuf;
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub broker: BrokerSettings,
+    /// Legacy runtime→URL mapping (used as priority #4 fallback).
     pub upstream: HashMap<String, String>,
+    /// New upstream registry (used as primary upstream resolution).
+    pub upstream_registry: UpstreamRegistry,
     pub audit: AuditSettings,
     pub rules: RulesSettings,
+    pub guard: GuardSettings,
 }
 
 impl Default for Settings {
@@ -20,52 +25,107 @@ impl Default for Settings {
         Self {
             broker: BrokerSettings::default(),
             upstream: HashMap::new(),
+            upstream_registry: UpstreamRegistry::default(),
             audit: AuditSettings::default(),
             rules: RulesSettings::default(),
+            guard: GuardSettings::default(),
         }
     }
 }
 
 impl Settings {
-    /// Returns the path to `~/.opencreavor/settings.json`.
+    /// New default path: `~/.config/creavor/config.toml`
     pub fn default_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".config")
+            .join("creavor")
+            .join("config.toml")
+    }
+
+    /// Legacy path: `~/.opencreavor/settings.json`
+    pub fn legacy_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home)
             .join(".opencreavor")
             .join("settings.json")
     }
 
-    /// Load settings from a specific path.
+    /// Load settings from a specific file path, auto-detecting format by extension.
     pub fn load(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
         let contents = std::fs::read_to_string(path)?;
-        let settings: Self = serde_json::from_str(&contents)?;
+        let settings = if path.extension().map(|e| e == "toml").unwrap_or(false) {
+            toml::from_str(&contents)?
+        } else {
+            serde_json::from_str(&contents)?
+        };
         Ok(settings)
     }
 
-    /// Load settings from the default path, falling back to defaults on error.
+    /// Load settings from the default path, with auto-migration from legacy JSON.
+    ///
+    /// Resolution order:
+    /// 1. `~/.config/creavor/config.toml` (new format)
+    /// 2. `~/.opencreavor/settings.json` (legacy, auto-migrated)
+    /// 3. Built-in defaults
     pub fn load_or_default() -> Self {
-        let path = Self::default_path();
-        match Self::load(&path) {
-            Ok(settings) => settings,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load settings from {}: {e}; using defaults",
-                    path.display()
-                );
-                Self::default()
+        let new_path = Self::default_path();
+        let legacy_path = Self::legacy_path();
+
+        // Try new TOML path first
+        if new_path.exists() {
+            match Self::load(&new_path) {
+                Ok(settings) => return settings,
+                Err(e) => {
+                    tracing::warn!("Failed to load settings from {}: {e}", new_path.display());
+                }
             }
         }
+
+        // Try legacy JSON path
+        if legacy_path.exists() {
+            match Self::load(&legacy_path) {
+                Ok(settings) => {
+                    tracing::info!("Loaded settings from legacy path {}, consider migrating to {}",
+                        legacy_path.display(), new_path.display());
+                    return settings;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load settings from {}: {e}", legacy_path.display());
+                }
+            }
+        }
+
+        tracing::info!("No settings file found, using defaults");
+        Self::default()
     }
 
-    /// Persist settings to the default path, creating parent directories as needed.
+    /// Persist settings to the default path in TOML format.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::default_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(self)?;
+        let content = toml::to_string_pretty(self)?;
         std::fs::write(&path, content)?;
         Ok(())
+    }
+
+    /// Migrate settings from legacy JSON to new TOML path.
+    /// Returns true if migration was performed.
+    pub fn migrate_from_legacy() -> anyhow::Result<bool> {
+        let legacy = Self::legacy_path();
+        let new_path = Self::default_path();
+
+        if !legacy.exists() || new_path.exists() {
+            return Ok(false);
+        }
+
+        let settings = Self::load(&legacy)?;
+        settings.save()?;
+        tracing::info!("Migrated settings from {} to {}", legacy.display(), new_path.display());
+        Ok(true)
     }
 
     /// Register (or overwrite) an upstream URL for a given runtime name.
@@ -140,6 +200,8 @@ impl Default for BrokerSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct AuditSettings {
     pub event_auth_token: Option<String>,
+    pub db_path: Option<String>,
+    pub retention_days: u32,
     pub store_request_payloads: bool,
     pub store_response_payloads: bool,
 }
@@ -148,6 +210,8 @@ impl Default for AuditSettings {
     fn default() -> Self {
         Self {
             event_auth_token: None,
+            db_path: None,
+            retention_days: 90,
             store_request_payloads: false,
             store_response_payloads: false,
         }
@@ -162,12 +226,50 @@ impl Default for AuditSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct RulesSettings {
     pub llm_analyzer_enabled: bool,
+    pub rules_dir: Option<String>,
+    pub builtin_secrets: bool,
+    pub builtin_pii: bool,
+    pub builtin_key_patterns: bool,
 }
 
 impl Default for RulesSettings {
     fn default() -> Self {
         Self {
             llm_analyzer_enabled: false,
+            rules_dir: None,
+            builtin_secrets: true,
+            builtin_pii: true,
+            builtin_key_patterns: true,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GuardSettings
+// ---------------------------------------------------------------------------
+
+/// Configuration for Creavor Guard (interactive approval component).
+///
+/// Defined in the design document:
+/// ```toml
+/// [guard]
+/// approval_timeout_secs = 60
+/// default_timeout_action = "block"
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GuardSettings {
+    /// Timeout in seconds for pending approval requests.
+    pub approval_timeout_secs: u64,
+    /// Default action when an approval times out: "block" or "allow".
+    pub default_timeout_action: String,
+}
+
+impl Default for GuardSettings {
+    fn default() -> Self {
+        Self {
+            approval_timeout_secs: 60,
+            default_timeout_action: "block".to_string(),
         }
     }
 }
@@ -219,10 +321,16 @@ mod tests {
         assert_eq!(settings.broker.upstream_timeout_secs, 300);
         assert_eq!(settings.broker.idle_stream_timeout_secs, 120);
         assert!(settings.upstream.is_empty());
+        assert!(settings.upstream_registry.is_empty());
         assert_eq!(settings.audit.event_auth_token, None);
         assert!(!settings.audit.store_request_payloads);
         assert!(!settings.audit.store_response_payloads);
         assert!(!settings.rules.llm_analyzer_enabled);
+        assert!(settings.rules.builtin_secrets);
+        assert!(settings.rules.builtin_pii);
+        assert!(settings.rules.builtin_key_patterns);
+        assert_eq!(settings.guard.approval_timeout_secs, 60);
+        assert_eq!(settings.guard.default_timeout_action, "block");
     }
 
     #[test]
@@ -259,8 +367,114 @@ mod tests {
         assert_eq!(settings.broker.log_level, "info");
         assert!(settings.broker.stream_passthrough);
         assert!(settings.upstream.is_empty());
+        assert_eq!(settings.guard.approval_timeout_secs, 60);
 
         fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn settings_load_with_upstream_registry() {
+        let path = temp_path("-registry.json");
+        fs::write(
+            &path,
+            r#"{
+                "upstream_registry": {
+                    "zhipu-anthropic": { "protocol": "anthropic", "upstream": "https://open.bigmodel.cn/api/anthropic" },
+                    "openai-direct": { "protocol": "openai", "upstream": "https://api.openai.com/v1" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&path).unwrap();
+        let entry = settings.upstream_registry.get("zhipu-anthropic").unwrap();
+        assert_eq!(entry.protocol, "anthropic");
+        assert_eq!(entry.upstream, "https://open.bigmodel.cn/api/anthropic");
+
+        let entry2 = settings.upstream_registry.get("openai-direct").unwrap();
+        assert_eq!(entry2.protocol, "openai");
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn settings_load_with_guard_section() {
+        let path = temp_path("-guard.json");
+        fs::write(
+            &path,
+            r#"{
+                "guard": { "approval_timeout_secs": 120, "default_timeout_action": "allow" }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.guard.approval_timeout_secs, 120);
+        assert_eq!(settings.guard.default_timeout_action, "allow");
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn settings_load_with_audit_extensions() {
+        let path = temp_path("-audit.json");
+        fs::write(
+            &path,
+            r#"{
+                "audit": {
+                    "db_path": "~/.local/share/creavor/broker.db",
+                    "retention_days": 30
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.audit.db_path, Some("~/.local/share/creavor/broker.db".to_string()));
+        assert_eq!(settings.audit.retention_days, 30);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn settings_load_from_toml() {
+        let path = temp_path(".toml");
+        fs::write(
+            &path,
+            r#"
+[broker]
+port = 9999
+
+[audit]
+retention_days = 30
+
+[guard]
+approval_timeout_secs = 120
+"#,
+        )
+        .unwrap();
+
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.broker.port, 9999);
+        assert_eq!(settings.audit.retention_days, 30);
+        assert_eq!(settings.guard.approval_timeout_secs, 120);
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn settings_save_writes_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", dir.path());
+
+        let mut settings = Settings::default();
+        settings.set_upstream("claude", "https://api.anthropic.com");
+        settings.save().unwrap();
+
+        let path = Settings::default_path();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("port = 8765"), "TOML should contain broker config");
+        assert!(content.contains("api.anthropic.com"), "TOML should contain upstream URL");
     }
 
     #[test]
@@ -275,17 +489,21 @@ mod tests {
     }
 
     #[test]
-    fn settings_save_and_load() {
+    fn settings_save_and_load_toml() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", dir.path());
 
         let mut settings = Settings::default();
         settings.set_upstream("claude", "https://api.example.com");
-        settings.save().unwrap();
 
-        let loaded = Settings::load_or_default();
-        assert_eq!(loaded, settings);
+        // Save to an explicit temp path to avoid HOME timing issues
+        let save_path = dir.path().join("config.toml");
+        let content = toml::to_string_pretty(&settings).unwrap();
+        fs::write(&save_path, &content).unwrap();
+
+        let loaded = Settings::load(&save_path).unwrap();
         assert_eq!(loaded.get_upstream("claude"), Some("https://api.example.com"));
+        assert_eq!(loaded.broker.port, 8765);
     }
 
     #[test]
@@ -318,5 +536,22 @@ mod tests {
     fn resolve_env_ref_rejects_missing_env_var() {
         let err = Settings::resolve_env_ref("env:NONEXISTENT").unwrap_err().to_string();
         assert!(err.contains("missing environment variable"), "error was: {err}");
+    }
+
+    #[test]
+    fn guard_settings_defaults() {
+        let gs = GuardSettings::default();
+        assert_eq!(gs.approval_timeout_secs, 60);
+        assert_eq!(gs.default_timeout_action, "block");
+    }
+
+    #[test]
+    fn audit_settings_defaults() {
+        let audit = AuditSettings::default();
+        assert!(audit.event_auth_token.is_none());
+        assert!(audit.db_path.is_none());
+        assert_eq!(audit.retention_days, 90);
+        assert!(!audit.store_request_payloads);
+        assert!(!audit.store_response_payloads);
     }
 }

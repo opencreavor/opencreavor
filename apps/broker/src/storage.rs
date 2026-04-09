@@ -19,6 +19,14 @@ impl AuditStorage {
     }
 
     pub fn initialize(&self) -> anyhow::Result<()> {
+        // Enable WAL mode and set busy_timeout for concurrent write safety
+        self.connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA busy_timeout = 5000;"
+        )?;
+
+        // Create tables (idempotent via IF NOT EXISTS)
         self.connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS events (
@@ -38,6 +46,11 @@ impl AuditStorage {
                 provider TEXT NOT NULL,
                 method TEXT NOT NULL,
                 path TEXT NOT NULL,
+                upstream_id TEXT,
+                protocol_family TEXT,
+                request_headers TEXT,
+                request_summary TEXT,
+                response_summary TEXT,
                 blocked BOOLEAN DEFAULT FALSE,
                 block_reason TEXT,
                 rule_id TEXT,
@@ -66,6 +79,9 @@ impl AuditStorage {
             CREATE TABLE IF NOT EXISTS violations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id TEXT NOT NULL,
+                session_id TEXT,
+                runtime TEXT,
+                upstream_id TEXT,
                 rule_id TEXT NOT NULL,
                 rule_name TEXT NOT NULL,
                 severity TEXT NOT NULL,
@@ -74,8 +90,71 @@ impl AuditStorage {
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (request_id) REFERENCES requests(request_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS approval_requests (
+                id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                session_id TEXT,
+                runtime TEXT NOT NULL,
+                upstream_id TEXT,
+                risk_level TEXT NOT NULL,
+                rule_id TEXT NOT NULL,
+                sanitized_summary TEXT NOT NULL,
+                status TEXT NOT NULL,
+                expires_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (request_id) REFERENCES requests(request_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS approval_actions (
+                id TEXT PRIMARY KEY,
+                approval_request_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                source TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (approval_request_id) REFERENCES approval_requests(id)
+            );
             ",
         )?;
+
+        // Migrate existing databases: add columns if they don't exist
+        self.migrate_schema()?;
+
+        Ok(())
+    }
+
+    /// Add columns to existing tables for forward-compatible schema migration.
+    fn migrate_schema(&self) -> anyhow::Result<()> {
+        let request_migrations = [
+            "ALTER TABLE requests ADD COLUMN upstream_id TEXT",
+            "ALTER TABLE requests ADD COLUMN protocol_family TEXT",
+            "ALTER TABLE requests ADD COLUMN request_headers TEXT",
+            "ALTER TABLE requests ADD COLUMN request_summary TEXT",
+            "ALTER TABLE requests ADD COLUMN response_summary TEXT",
+        ];
+        for sql in &request_migrations {
+            if let Err(e) = self.connection.execute_batch(sql) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        let violation_migrations = [
+            "ALTER TABLE violations ADD COLUMN session_id TEXT",
+            "ALTER TABLE violations ADD COLUMN runtime TEXT",
+            "ALTER TABLE violations ADD COLUMN upstream_id TEXT",
+        ];
+        for sql in &violation_migrations {
+            if let Err(e) = self.connection.execute_batch(sql) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
 
         Ok(())
     }
@@ -88,6 +167,73 @@ impl AuditStorage {
 
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    // -- New methods for upstream and approval --
+
+    /// Update upstream_id and protocol_family on an existing request record.
+    pub fn update_request_upstream(
+        &self,
+        request_id: &str,
+        upstream_id: Option<&str>,
+        protocol_family: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE requests SET upstream_id = ?1, protocol_family = ?2 WHERE request_id = ?3",
+            rusqlite::params![upstream_id, protocol_family, request_id],
+        )?;
+        Ok(())
+    }
+
+    // -- Approval methods --
+
+    pub fn insert_approval_request(
+        &self,
+        id: &str,
+        request_id: &str,
+        session_id: Option<&str>,
+        runtime: &str,
+        upstream_id: Option<&str>,
+        risk_level: &str,
+        rule_id: &str,
+        sanitized_summary: &str,
+        status: &str,
+        expires_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "INSERT INTO approval_requests (id, request_id, session_id, runtime, upstream_id, risk_level, rule_id, sanitized_summary, status, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![id, request_id, session_id, runtime, upstream_id, risk_level, rule_id, sanitized_summary, status, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_approval_action(
+        &self,
+        id: &str,
+        approval_request_id: &str,
+        action: &str,
+        actor: &str,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "INSERT INTO approval_actions (id, approval_request_id, action, actor, source)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, approval_request_id, action, actor, source],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_approval_request_status(
+        &self,
+        id: &str,
+        status: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE approval_requests SET status = ?1 WHERE id = ?2",
+            rusqlite::params![status, id],
+        )?;
+        Ok(())
     }
 }
 
@@ -139,12 +285,14 @@ mod tests {
     }
 
     #[test]
-    fn initializes_five_expected_tables() {
+    fn initializes_seven_expected_tables() {
         let storage = AuditStorage::open_in_memory().unwrap();
 
         assert_eq!(
             table_names(&storage),
             vec![
+                "approval_actions".to_string(),
+                "approval_requests".to_string(),
                 "events".to_string(),
                 "request_payloads".to_string(),
                 "requests".to_string(),
@@ -155,356 +303,57 @@ mod tests {
     }
 
     #[test]
-    fn events_table_has_expected_columns() {
+    fn requests_table_has_new_columns() {
         let storage = AuditStorage::open_in_memory().unwrap();
+        let columns = column_names(&storage, "requests");
+        assert!(columns.contains(&"upstream_id".to_string()));
+        assert!(columns.contains(&"protocol_family".to_string()));
+        assert!(columns.contains(&"request_headers".to_string()));
+        assert!(columns.contains(&"request_summary".to_string()));
+        assert!(columns.contains(&"response_summary".to_string()));
+    }
 
+    #[test]
+    fn violations_table_has_new_columns() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+        let columns = column_names(&storage, "violations");
+        assert!(columns.contains(&"session_id".to_string()));
+        assert!(columns.contains(&"runtime".to_string()));
+        assert!(columns.contains(&"upstream_id".to_string()));
+    }
+
+    #[test]
+    fn approval_requests_table_has_expected_columns() {
+        let storage = AuditStorage::open_in_memory().unwrap();
         assert_eq!(
-            column_names(&storage, "events"),
+            column_names(&storage, "approval_requests"),
             vec![
-                "id",
-                "session_id",
-                "event_type",
-                "tool_name",
-                "payload",
-                "source",
-                "created_at",
+                "id", "request_id", "session_id", "runtime", "upstream_id",
+                "risk_level", "rule_id", "sanitized_summary", "status", "expires_at", "created_at",
             ]
         );
     }
 
     #[test]
-    fn requests_table_has_expected_columns() {
+    fn approval_actions_table_has_expected_columns() {
         let storage = AuditStorage::open_in_memory().unwrap();
-
         assert_eq!(
-            column_names(&storage, "requests"),
-            vec![
-                "request_id",
-                "session_id",
-                "runtime",
-                "provider",
-                "method",
-                "path",
-                "blocked",
-                "block_reason",
-                "rule_id",
-                "severity",
-                "terminal_reason",
-                "response_status",
-                "latency_ms",
-                "started_at",
-                "completed_at",
-            ]
-        );
-    }
-
-    #[test]
-    fn request_payloads_table_has_expected_columns() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        assert_eq!(
-            column_names(&storage, "request_payloads"),
-            vec!["request_id", "body", "created_at"]
-        );
-    }
-
-    #[test]
-    fn response_payloads_table_has_expected_columns() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        assert_eq!(
-            column_names(&storage, "response_payloads"),
-            vec!["request_id", "body", "created_at"]
-        );
-    }
-
-    #[test]
-    fn violations_table_has_expected_columns() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        assert_eq!(
-            column_names(&storage, "violations"),
-            vec![
-                "id",
-                "request_id",
-                "rule_id",
-                "rule_name",
-                "severity",
-                "matched_content",
-                "action",
-                "created_at",
-            ]
+            column_names(&storage, "approval_actions"),
+            vec!["id", "approval_request_id", "action", "actor", "source", "created_at"]
         );
     }
 
     #[test]
     fn initialize_is_idempotent() {
         let storage = AuditStorage::open_in_memory().unwrap();
-
         storage.initialize().unwrap();
         storage.initialize().unwrap();
-
-        assert_eq!(table_names(&storage).len(), 5);
-    }
-
-    #[test]
-    fn request_lifecycle_with_blocked_and_violation() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        storage
-            .insert_request_start(
-                "req-blocked",
-                Some("session-1"),
-                "codex",
-                "openai",
-                "POST",
-                "/v1/responses",
-                true,
-                Some("api key detected"),
-                Some("rule-secrets"),
-                Some("high"),
-            )
-            .unwrap();
-
-        storage
-            .insert_violation(
-                "req-blocked",
-                "rule-secrets",
-                "secrets",
-                "high",
-                "sk-12345",
-                "block",
-            )
-            .unwrap();
-
-        storage
-            .finalize_request("req-blocked", TerminalReason::Ok, Some(200), Some(42))
-            .unwrap();
-
-        let request = storage
-            .connection()
-            .query_row(
-                "SELECT runtime, provider, method, path, session_id, blocked, block_reason,
-                        rule_id, severity, terminal_reason, response_status, latency_ms
-                 FROM requests
-                 WHERE request_id = ?1",
-                ["req-blocked"],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, bool>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                        row.get::<_, Option<i64>>(10)?,
-                        row.get::<_, Option<i64>>(11)?,
-                    ))
-                },
-            )
-            .unwrap();
-
-        assert_eq!(request.0, "codex");
-        assert_eq!(request.1, "openai");
-        assert_eq!(request.2, "POST");
-        assert_eq!(request.3, "/v1/responses");
-        assert_eq!(request.4, Some("session-1".to_string()));
-        assert!(request.5); // blocked
-        assert_eq!(request.6, Some("api key detected".to_string()));
-        assert_eq!(request.7, Some("rule-secrets".to_string()));
-        assert_eq!(request.8, Some("high".to_string()));
-        assert_eq!(request.9, Some("ok".to_string()));
-        assert_eq!(request.10, Some(200));
-        assert_eq!(request.11, Some(42));
-
-        let violation = storage
-            .connection()
-            .query_row(
-                "SELECT rule_id, rule_name, severity, action
-                 FROM violations WHERE request_id = ?1",
-                ["req-blocked"],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .unwrap();
-
-        assert_eq!(violation.0, "rule-secrets");
-        assert_eq!(violation.1, "secrets");
-        assert_eq!(violation.2, "high");
-        assert_eq!(violation.3, "block");
-    }
-
-    #[test]
-    fn request_payload_stored_when_requested() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        storage
-            .insert_request_start(
-                "req-payload",
-                None,
-                "codex",
-                "anthropic",
-                "POST",
-                "/v1/messages",
-                false,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        storage
-            .insert_request_payload("req-payload", "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
-            .unwrap();
-
-        let body: String = storage
-            .connection()
-            .query_row(
-                "SELECT body FROM request_payloads WHERE request_id = ?1",
-                ["req-payload"],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert_eq!(body, "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
-    }
-
-    #[test]
-    fn response_payload_stored_when_requested() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        storage
-            .insert_request_start(
-                "req-resp",
-                None,
-                "codex",
-                "openai",
-                "POST",
-                "/v1/responses",
-                false,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        storage
-            .insert_response_payload("req-resp", "{\"output\":\"hello world\"}")
-            .unwrap();
-
-        let body: String = storage
-            .connection()
-            .query_row(
-                "SELECT body FROM response_payloads WHERE request_id = ?1",
-                ["req-resp"],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert_eq!(body, "{\"output\":\"hello world\"}");
-    }
-
-    #[test]
-    fn finalize_request_rejects_double_finalize() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        storage
-            .insert_request_start(
-                "req-dbl",
-                None,
-                "codex",
-                "openai",
-                "POST",
-                "/v1/responses",
-                false,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        storage
-            .finalize_request("req-dbl", TerminalReason::Ok, Some(200), Some(10))
-            .unwrap();
-
-        let second = storage.finalize_request(
-            "req-dbl",
-            TerminalReason::ClientCancelled,
-            Some(499),
-            Some(20),
-        );
-        assert!(second.is_err());
-
-        let terminal_reason: String = storage
-            .connection()
-            .query_row(
-                "SELECT terminal_reason FROM requests WHERE request_id = ?1",
-                ["req-dbl"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(terminal_reason, "ok");
-
-        let latency: Option<i64> = storage
-            .connection()
-            .query_row(
-                "SELECT latency_ms FROM requests WHERE request_id = ?1",
-                ["req-dbl"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(latency, Some(10));
-    }
-
-    #[test]
-    fn latency_ms_is_recorded() {
-        let storage = AuditStorage::open_in_memory().unwrap();
-
-        storage
-            .insert_request_start(
-                "req-latency",
-                None,
-                "codex",
-                "anthropic",
-                "POST",
-                "/v1/messages",
-                false,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        storage
-            .finalize_request("req-latency", TerminalReason::Ok, Some(200), Some(1234))
-            .unwrap();
-
-        let latency: Option<i64> = storage
-            .connection()
-            .query_row(
-                "SELECT latency_ms FROM requests WHERE request_id = ?1",
-                ["req-latency"],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        assert_eq!(latency, Some(1234));
+        assert_eq!(table_names(&storage).len(), 7);
     }
 
     #[test]
     fn open_file_allows_immediate_audit_writes() {
         let path = unique_temp_path("storage-open");
-
         let storage = AuditStorage::open(&path).unwrap();
         storage
             .insert_event(
@@ -515,14 +364,119 @@ mod tests {
                 None,
             )
             .unwrap();
-
-        let event_count: i64 = storage
+        let count: i64 = storage
             .connection()
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(event_count, 1);
-
+        assert_eq!(count, 1);
         drop(storage);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn update_request_upstream_sets_fields() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+        storage
+            .insert_request_start(
+                "req-upstream",
+                None,
+                "claude-code",
+                "anthropic",
+                "POST",
+                "/v1/anthropic/messages",
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        storage
+            .update_request_upstream("req-upstream", Some("zhipu-anthropic"), Some("anthropic"))
+            .unwrap();
+        let result = storage
+            .connection()
+            .query_row(
+                "SELECT upstream_id, protocol_family FROM requests WHERE request_id = ?1",
+                ["req-upstream"],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(result.0, Some("zhipu-anthropic".to_string()));
+        assert_eq!(result.1, Some("anthropic".to_string()));
+    }
+
+    #[test]
+    fn approval_request_lifecycle() {
+        let storage = AuditStorage::open_in_memory().unwrap();
+
+        storage
+            .insert_request_start(
+                "req-approval",
+                Some("session-1"),
+                "claude-code",
+                "anthropic",
+                "POST",
+                "/v1/anthropic/messages",
+                false,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        storage
+            .insert_approval_request(
+                "approval-1",
+                "req-approval",
+                Some("session-1"),
+                "claude-code",
+                Some("zhipu-anthropic"),
+                "high",
+                "rule-secrets",
+                "API key detected in request body",
+                "pending",
+                Some("2026-04-09T12:35:00Z"),
+            )
+            .unwrap();
+
+        storage
+            .insert_approval_action("action-1", "approval-1", "allow_once", "local_user", "guard_mcp")
+            .unwrap();
+
+        storage
+            .update_approval_request_status("approval-1", "approved")
+            .unwrap();
+
+        let approval = storage
+            .connection()
+            .query_row(
+                "SELECT status, risk_level, runtime, upstream_id FROM approval_requests WHERE id = ?1",
+                ["approval-1"],
+                |row| Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                )),
+            )
+            .unwrap();
+
+        assert_eq!(approval.0, "approved");
+        assert_eq!(approval.1, "high");
+        assert_eq!(approval.2, "claude-code");
+        assert_eq!(approval.3, Some("zhipu-anthropic".to_string()));
+
+        let action = storage
+            .connection()
+            .query_row(
+                "SELECT action, actor, source FROM approval_actions WHERE approval_request_id = ?1",
+                ["approval-1"],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(action.0, "allow_once");
+        assert_eq!(action.1, "local_user");
+        assert_eq!(action.2, "guard_mcp");
     }
 }

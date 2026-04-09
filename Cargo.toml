@@ -1,3 +1,3 @@
 [workspace]
-members = ["apps/broker", "apps/creavor-cli", "libs/creavor-core"]
+members = ["apps/broker", "apps/creavor-cli", "apps/guard", "libs/creavor-core"]
 resolver = "2"

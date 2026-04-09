@@ -4,6 +4,7 @@ mod codex;
 mod gemini;
 mod openclaw;
 mod opencode;
+mod qwen;
 
 use crate::settings::RuntimeType;
 
@@ -15,6 +16,7 @@ pub fn run(runtime: RuntimeType) -> anyhow::Result<()> {
         RuntimeType::Codex => codex::run(),
         RuntimeType::Cline => cline::run(),
         RuntimeType::Gemini => gemini::run(),
+        RuntimeType::Qwen => qwen::run(),
     }
 }
 
@@ -26,5 +28,6 @@ pub fn config(runtime: RuntimeType) -> anyhow::Result<()> {
         RuntimeType::Codex => codex::config(),
         RuntimeType::Cline => cline::config(),
         RuntimeType::Gemini => gemini::config(),
+        RuntimeType::Qwen => qwen::config(),
     }
 }

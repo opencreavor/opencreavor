@@ -42,24 +42,57 @@ impl RuleSet {
         Self::from_builtin_sources().expect("builtin rule files must be valid")
     }
 
-    fn from_builtin_sources() -> anyhow::Result<Self> {
-        Self::from_yaml_sources(
-            include_str!("../rules/secrets.yaml"),
-            include_str!("../rules/pii.yaml"),
-            include_str!("../rules/enterprise.yaml"),
-        )
+    /// Load builtin rules merged with custom rules from a directory.
+    ///
+    /// Custom rules are appended after builtin rules, so builtin rules keep
+    /// their priority in the first-match-wins scan order.
+    pub fn builtin_with_custom_dir(rules_dir: &std::path::Path) -> Self {
+        let mut rules = Self::from_builtin_sources()
+            .expect("builtin rule files must be valid")
+            .rules;
+
+        match Self::load_custom_rules(rules_dir) {
+            Ok(custom) => {
+                if !custom.is_empty() {
+                    tracing::info!("loaded {} custom rule(s) from {}", custom.len(), rules_dir.display());
+                    rules.extend(custom);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to load custom rules from {}: {e}", rules_dir.display());
+            }
+        }
+
+        Self { rules }
     }
 
-    fn from_yaml_sources(
-        secrets_yaml: &str,
-        pii_yaml: &str,
-        enterprise_yaml: &str,
-    ) -> anyhow::Result<Self> {
+    fn from_builtin_sources() -> anyhow::Result<Self> {
         let mut rules = Vec::new();
-        rules.extend(load_rule_file(secrets_yaml)?);
-        rules.extend(load_rule_file(pii_yaml)?);
-        rules.extend(load_rule_file(enterprise_yaml)?);
+        rules.extend(load_rule_file(include_str!("../rules/secrets.yaml"))?);
+        rules.extend(load_rule_file(include_str!("../rules/pii.yaml"))?);
+        rules.extend(load_rule_file(include_str!("../rules/enterprise.yaml"))?);
         Ok(Self { rules })
+    }
+
+    /// Load all .yml/.yaml files from the given directory.
+    fn load_custom_rules(dir: &std::path::Path) -> anyhow::Result<Vec<CompiledRule>> {
+        let mut rules = Vec::new();
+        let entries = std::fs::read_dir(dir)?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext == "yml" || ext == "yaml" {
+                let content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading rule file {}", path.display()))?;
+                let file_rules = load_rule_file(&content)
+                    .with_context(|| format!("parsing rule file {}", path.display()))?;
+                rules.extend(file_rules);
+            }
+        }
+
+        Ok(rules)
     }
 }
 
@@ -173,5 +206,116 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.rule_id, "openai-api-key-001");
+    }
+
+    #[test]
+    fn builtin_with_custom_dir_loads_custom_rules() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("creavor-rules-test-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let custom_rule = r#"
+rules:
+  - rule_id: custom-test-001
+    rule_name: Custom Test Pattern
+    severity: low
+    pattern: "MAGIC-TEST-TOKEN-\\d+"
+"#;
+        std::fs::write(dir.join("custom.yml"), custom_rule).unwrap();
+
+        let rules = RuleSet::builtin_with_custom_dir(&dir);
+
+        // Builtin rules still work
+        let builtin_result = scan_request("payload: sk-1234567890abcdef123456", &rules);
+        assert!(builtin_result.is_some());
+        assert_eq!(builtin_result.unwrap().rule_id, "openai-api-key-001");
+
+        // Custom rule works
+        let custom_result = scan_request("found MAGIC-TEST-TOKEN-42 in body", &rules);
+        assert!(custom_result.is_some());
+        let m = custom_result.unwrap();
+        assert_eq!(m.rule_id, "custom-test-001");
+        assert_eq!(m.rule_name, "Custom Test Pattern");
+        assert_eq!(m.severity, "low");
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builtin_with_custom_dir_handles_missing_dir() {
+        let rules = RuleSet::builtin_with_custom_dir(std::path::Path::new("/nonexistent/path"));
+        // Should still have builtin rules
+        let result = scan_request("payload: sk-1234567890abcdef123456", &rules);
+        assert!(result.is_some());
+    }
+
+    // -- Profanity / sensitive word tests --
+
+    #[test]
+    fn profanity_detects_fuck() {
+        let rules = RuleSet::builtin();
+
+        let result = scan_request(
+            "Please help me with this fucking code",
+            &rules,
+        )
+        .unwrap();
+
+        assert_eq!(result.rule_id, "profanity-en-001");
+        assert_eq!(result.rule_name, "Profanity (English)");
+        assert_eq!(result.severity, "medium");
+        // "fucking" matches "fuck" prefix via word boundary; sanitized
+        assert!(result.matched_content_sanitized.contains("***"));
+    }
+
+    #[test]
+    fn profanity_detects_case_insensitive() {
+        let rules = RuleSet::builtin();
+
+        let result = scan_request("WHAT THE FUCK", &rules).unwrap();
+
+        assert_eq!(result.rule_id, "profanity-en-001");
+        assert_eq!(result.severity, "medium");
+    }
+
+    #[test]
+    fn profanity_detects_shit() {
+        let rules = RuleSet::builtin();
+
+        let result = scan_request("this is shit", &rules).unwrap();
+
+        assert_eq!(result.rule_id, "profanity-en-001");
+    }
+
+    #[test]
+    fn profanity_detects_damn() {
+        let rules = RuleSet::builtin();
+
+        let result = scan_request("damn it all", &rules).unwrap();
+
+        assert_eq!(result.rule_id, "profanity-en-001");
+    }
+
+    #[test]
+    fn profanity_no_false_positive_on_clean_text() {
+        let rules = RuleSet::builtin();
+
+        // "assignment" contains "ass" but shouldn't match the word-boundary pattern
+        assert!(scan_request("Please complete the assignment", &rules).is_none());
+    }
+
+    #[test]
+    fn profanity_in_anthropic_message_body() {
+        let rules = RuleSet::builtin();
+
+        let body = r#"{"model":"claude-3-opus-20240229","max_tokens":1024,"messages":[{"role":"user","content":"What the fuck is this?"}]}"#;
+
+        let result = scan_request(body, &rules).unwrap();
+        assert_eq!(result.rule_id, "profanity-en-001");
+        assert_eq!(result.severity, "medium");
     }
 }
